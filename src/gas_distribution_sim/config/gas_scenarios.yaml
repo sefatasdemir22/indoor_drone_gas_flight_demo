@@ -1,0 +1,45 @@
+# gas_scenarios.yaml
+# Gaz bölgelerinin merkez koordinatları (x, y, z), yarıçapları (r) ve yoğunlukları (ppm)
+
+scenarios:
+  # SENARYO 1: Güvenli Ortam (Jüriye "Bakın hata yapmıyor" demek için)
+  clean_sweep:
+    description: "Tüm mağara temiz, gaz yok."
+    active_zones: []
+
+  # SENARYO 2: Sadece Dip Oda (Klasik Demo)
+  deep_trouble:
+    description: "Sadece mağaranın en sonundaki odada sızıntı var."
+    active_zones: ["zone_E"]
+
+  # SENARYO 3: Rastgele Tehlike (Zorlu Test)
+  random_hazard:
+    description: "Ara tünellerde ve çıkışta gaz sızıntıları var."
+    active_zones: ["zone_B", "zone_D"]
+
+# Potansiyel Bölgelerin Tanımı (Mağara Haritasına Göre)
+available_zones:
+  zone_A: # Giriş (Genelde temiz)
+    position: [0.0, 0.0, 1.0]
+    radius: 3.0
+    max_ppm: 100.0
+  
+  zone_B: # İlk Tünel
+    position: [5.0, 2.0, 1.0]
+    radius: 2.5
+    max_ppm: 300.0
+
+  zone_C: # Geniş Galeri (Sol taraf)
+    position: [10.0, 5.0, 2.0]
+    radius: 5.0
+    max_ppm: 600.0
+
+  zone_D: # Dar Geçit (Sağ taraf)
+    position: [12.0, -3.0, 1.0]
+    radius: 2.0
+    max_ppm: 450.0
+
+  zone_E: # Cehennem Çukuru (Dip nokta)
+    position: [20.0, 0.0, 0.5]
+    radius: 6.0
+    max_ppm: 1000.0

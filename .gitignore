@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.ulg
+dataman
+*.log
+log/
+logs/
+build/
+install/
+.ros/
+.gazebo/
+.vscode/
+.idea/
+.DS_Store
+results/
+
+# Large legacy SubT cave assets kept local
+src/gas_distribution_sim/models/subt_cave_sim/
+
+# Legacy runtime logs
+gas_map_logs/
+gas_sensor_logs/
