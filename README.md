@@ -96,3 +96,36 @@ cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
 ```
 
 Bu kisim gercek drone ucurmaz. PX4/Gazebo ucus altyapisi ayri olarak `./baslat.sh` ve `src/mission_manager.py` ile yurutulur. Sonraki asamada gercek veya simule drone pozisyonu ile gaz olcumu birlestirilecektir.
+
+## Live ROS2 Gas Mapping Demo
+
+`mission_manager.py` MAVSDK ile ucus kontrolu icindir. Canli gaz haritalama ise MAVSDK port/grpc cakismasini onlemek icin ROS2 topic uzerinden yapilir.
+
+`src/live_gas_mapping_ros2.py`, PX4 tarafindan yayinlanan `/fmu/out/vehicle_local_position_v1` topicini dinler, `px4_msgs/msg/VehicleLocalPosition` icindeki `x`, `y`, `z` konumlarini kullanir ve mevcut gaz senaryo modeliyle ppm hesaplayarak heatmap uretir. Bu script drone'a komut gondermez.
+
+Terminal 1:
+
+```bash
+cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
+./baslat.sh
+```
+
+Terminal 2:
+
+```bash
+python3 src/mission_manager.py --mode mavsdk --takeoff-altitude 1.5 --takeoff-timeout 25 --hover-seconds 10 --connection-timeout 30
+```
+
+Terminal 3:
+
+```bash
+python3 src/live_gas_mapping_ros2.py --scenario random --duration-seconds 30 --sample-rate-hz 5
+```
+
+Uretilen ROS2 live ciktilar:
+
+- `results/live_ros2_gas_samples.csv`
+- `results/live_ros2_scenario_info.json`
+- `results/live_ros2_gas_heatmap.png`
+
+Not: Lidar/lazer sensorleri kaldirilmamistir; bu asamada kontrol dongusunde aktif kullanilmaz. Lidar tabanli guvenlik ve kacinma sonraki asamadir.

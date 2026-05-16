@@ -205,10 +205,14 @@ async def wait_until_takeoff_altitude(
     )
 
     async def _wait() -> bool:
+        last_altitude_log_time = 0.0
         async for position_velocity in drone.telemetry.position_velocity_ned():
             position = position_velocity.position
             altitude_estimate = abs(position.down_m)
-            log_state(MissionState.TAKEOFF, f"current altitude estimate: {altitude_estimate:.2f} m")
+            now = time.monotonic()
+            if now - last_altitude_log_time >= 1.0:
+                log_state(MissionState.TAKEOFF, f"current altitude estimate: {altitude_estimate:.2f} m")
+                last_altitude_log_time = now
             if abs(altitude_estimate - target_altitude_m) < tolerance_m:
                 return True
             if position.down_m <= -(target_altitude_m - tolerance_m):
