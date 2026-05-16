@@ -30,3 +30,14 @@ Ardindan ayri terminalde MAVSDK modu denenebilir:
 ```bash
 python3 src/mission_manager.py --mode mavsdk --takeoff-altitude 1.5 --takeoff-timeout 25 --hover-seconds 5 --connection-timeout 30
 ```
+
+## Gas Mapping / Heatmap Tools
+
+Eski `indoor_drone_gas_demo` prototipinden gaz senaryosu, CSV uretimi ve heatmap araclari bu repoya tasindi.
+
+- Python araclari: `src/demo_tools/`
+- Calistirma scriptleri: `scripts/`
+- Ornek heatmap gorselleri: `docs/media/`
+- Runtime ciktilari: `results/` altinda uretilir ve Git'e alinmaz.
+
+Bu kisim PX4/Gazebo ucusunu dogrudan kontrol etmez. Simule rota uzerinden gaz olcumu ve haritalama ciktisi uretir.

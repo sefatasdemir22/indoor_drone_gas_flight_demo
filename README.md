@@ -60,4 +60,39 @@ python3 src/mission_manager.py --mode sim --sleep 0
 
 - Bu demo eski çalışan `araswarm_simulation` altyapısından sade indoor world için uyarlanmıştır.
 - `baslat.sh`, MicroXRCEAgent, Gazebo launch, PX4 ve `spawn_entity.py` sırasını korur.
-- Gaz haritalama/heatmap modülü bu repoya henüz taşınmamıştır; sonraki entegrasyon aşamasında eklenecektir.
+- Gaz haritalama/heatmap araçları `src/demo_tools` ve `scripts` altına taşınmıştır. Gerçek drone pozisyonu ile entegrasyon sonraki aşamadadır.
+
+## Gas Mapping / Heatmap Demo
+
+Gaz haritalama demosu, PX4 ucusunu dogrudan kontrol etmez. Simule gorev rotasi uzerinden gaz olcumu uretir, CSV/JSON kaydeder ve 2B heatmap PNG olusturur.
+
+```bash
+cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
+./scripts/run_mapper.sh random
+./scripts/run_mapper.sh no_gas
+./scripts/run_mapper.sh multi_1_2
+./scripts/run_mapper.sh multi_all
+```
+
+Uretilen ciktilar:
+
+- `results/gas_samples.csv`
+- `results/scenario_info.json`
+- `results/gas_heatmap.png`
+- `results/heatmaps/`
+
+Desteklenen senaryo tipleri temiz hava, tek kaynak, coklu kaynak ve rastgele secim mantigini icerir. Aktif gaz kaynaklari Python tarafinda secilir; world icindeki markerlar yalnizca aday bolge gorselleridir.
+
+## Full Simulated Demo
+
+Full simulated demo, Gazebo/PX4 baslatmadan once terminalde gorev FSM akisini simule eder ve ardindan secilen gaz senaryosu icin haritalama ciktisi uretir.
+
+```bash
+cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
+./scripts/run_full_demo.sh random
+./scripts/run_full_demo.sh no_gas
+./scripts/run_full_demo.sh multi_1_2
+./scripts/run_full_demo.sh multi_all
+```
+
+Bu kisim gercek drone ucurmaz. PX4/Gazebo ucus altyapisi ayri olarak `./baslat.sh` ve `src/mission_manager.py` ile yurutulur. Sonraki asamada gercek veya simule drone pozisyonu ile gaz olcumu birlestirilecektir.
