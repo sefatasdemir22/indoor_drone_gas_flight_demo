@@ -49,6 +49,8 @@ MISSION_WAYPOINTS: list[Waypoint] = [
     Waypoint("START_SAFE_EXIT_RETURN", 0.0, 0.0, 1.5),
 ]
 
+DEFAULT_SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the simulated mission FSM.")
@@ -64,7 +66,11 @@ def parse_args() -> argparse.Namespace:
         default=0.25,
         help="Delay in seconds between simulated state transitions.",
     )
-    parser.add_argument("--system-address", default="udp://:14540")
+    parser.add_argument(
+        "--system-address",
+        default=DEFAULT_SYSTEM_ADDRESS,
+        help=f"MAVSDK system address. Default: {DEFAULT_SYSTEM_ADDRESS}",
+    )
     parser.add_argument("--takeoff-altitude", type=float, default=2.0)
     parser.add_argument("--takeoff-timeout", type=float, default=25.0)
     parser.add_argument("--takeoff-altitude-tolerance", type=float, default=0.5)
@@ -73,10 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enable-short-move",
         action="store_true",
-        help="After takeoff, run a short low-speed offboard forward movement before landing.",
+        help="After takeoff, run a short low-speed offboard NED velocity move before landing.",
     )
     parser.add_argument("--move-forward-seconds", type=float, default=4.0)
     parser.add_argument("--move-forward-speed", type=float, default=0.5)
+    parser.add_argument("--move-north-speed", type=float, default=None)
+    parser.add_argument("--move-east-speed", type=float, default=None)
     parser.add_argument("--move-rate-hz", type=float, default=10.0)
     return parser.parse_args()
 
@@ -191,6 +199,22 @@ async def try_mavsdk_land(drone: object) -> None:
         log_state(MissionState.LAND, f"safety land attempt failed: {exc}")
 
 
+def is_grpc_disconnect_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "grpc",
+            "channel",
+            "connection",
+            "socket",
+            "unavailable",
+            "connection reset",
+            "broken pipe",
+        )
+    )
+
+
 async def wait_until_takeoff_altitude(
     drone: object,
     target_altitude_m: float,
@@ -249,16 +273,27 @@ async def read_local_position_ned(drone: object, label: str) -> object | None:
     return position
 
 
+def get_short_move_velocity(args: argparse.Namespace) -> tuple[float, float]:
+    if args.move_north_speed is None and args.move_east_speed is None:
+        return max(0.0, args.move_forward_speed), 0.0
+
+    north_speed = args.move_north_speed if args.move_north_speed is not None else 0.0
+    east_speed = args.move_east_speed if args.move_east_speed is not None else 0.0
+    return north_speed, east_speed
+
+
 async def run_short_forward_move(drone: object, args: argparse.Namespace, velocity_type: object) -> None:
-    speed = max(0.0, args.move_forward_speed)
+    north_speed, east_speed = get_short_move_velocity(args)
     duration = max(0.0, args.move_forward_seconds)
     rate_hz = max(1.0, args.move_rate_hz)
     interval = 1.0 / rate_hz
     setpoint_count = 0
 
-    log_state(MissionState.MOVE, "starting short forward move")
-    if args.move_forward_speed < 0:
-        log_state(MissionState.MOVE, f"negative speed requested; clamped to {speed:.2f} m/s")
+    log_state(MissionState.MOVE, "starting short NED move")
+    log_state(MissionState.MOVE, f"north speed = {north_speed:.2f} m/s")
+    log_state(MissionState.MOVE, f"east speed = {east_speed:.2f} m/s")
+    if args.move_north_speed is None and args.move_east_speed is None and args.move_forward_speed < 0:
+        log_state(MissionState.MOVE, f"negative legacy speed requested; clamped to {north_speed:.2f} m/s")
     if args.move_rate_hz < 1.0:
         log_state(MissionState.MOVE, f"move rate too low; clamped to {rate_hz:.1f} Hz")
     if duration < 1.0:
@@ -274,11 +309,11 @@ async def run_short_forward_move(drone: object, args: argparse.Namespace, veloci
 
     log_state(
         MissionState.MOVE,
-        f"velocity command loop: north={speed:.2f} m/s, east=0.00 m/s, down=0.00 m/s, duration={duration:.1f}s, rate={rate_hz:.1f}Hz",
+        f"NED velocity command loop: north={north_speed:.2f} m/s, east={east_speed:.2f} m/s, down=0.00 m/s, duration={duration:.1f}s, rate={rate_hz:.1f}Hz",
     )
     loop_start = asyncio.get_running_loop().time()
     while asyncio.get_running_loop().time() - loop_start < duration:
-        await drone.offboard.set_velocity_ned(velocity_type(speed, 0.0, 0.0, 0.0))
+        await drone.offboard.set_velocity_ned(velocity_type(north_speed, east_speed, 0.0, 0.0))
         setpoint_count += 1
         await asyncio.sleep(interval)
 
@@ -286,7 +321,7 @@ async def run_short_forward_move(drone: object, args: argparse.Namespace, veloci
     for _ in range(5):
         await drone.offboard.set_velocity_ned(velocity_type(0.0, 0.0, 0.0, 0.0))
         await asyncio.sleep(interval)
-    log_state(MissionState.MOVE, f"sent {setpoint_count} forward velocity setpoints")
+    log_state(MissionState.MOVE, f"sent {setpoint_count} NED velocity setpoints")
 
     end_position = await read_local_position_ned(drone, "end")
     if start_position is not None and end_position is not None:
@@ -311,10 +346,10 @@ async def run_mavsdk_takeoff_land(args: argparse.Namespace) -> int:
         return 1
 
     drone = System()
+    land_requested = False
 
     print("Mission manager mode: mavsdk")
-    print("This mode does not run the room waypoint mission yet.")
-    print("It only connects to PX4 SITL and performs takeoff/hover/land.")
+    print("Running PX4 SITL takeoff/hover/land check.")
     print(f"system_address={args.system_address}")
     print(f"takeoff_altitude={args.takeoff_altitude:.1f} m")
     print(f"takeoff_timeout={args.takeoff_timeout:.1f} s")
@@ -322,8 +357,10 @@ async def run_mavsdk_takeoff_land(args: argparse.Namespace) -> int:
     print(f"hover_seconds={args.hover_seconds:.1f} s")
     print(f"short_move_enabled={args.enable_short_move}")
     if args.enable_short_move:
-        print(f"move_forward_seconds={args.move_forward_seconds:.1f} s")
-        print(f"move_forward_speed={args.move_forward_speed:.2f} m/s")
+        north_speed, east_speed = get_short_move_velocity(args)
+        print(f"move_duration_seconds={args.move_forward_seconds:.1f} s")
+        print(f"move_north_speed={north_speed:.2f} m/s")
+        print(f"move_east_speed={east_speed:.2f} m/s")
         print(f"move_rate_hz={args.move_rate_hz:.1f} Hz")
     print()
 
@@ -360,18 +397,41 @@ async def run_mavsdk_takeoff_land(args: argparse.Namespace) -> int:
         elif args.enable_short_move:
             log_state(MissionState.MOVE, "short move skipped because takeoff altitude was not reached")
 
-        log_state(MissionState.LAND, "land command sent")
+        log_state(MissionState.LAND, "sending land command")
+        land_requested = True
         await drone.action.land()
 
         log_state(MissionState.FINISH, "MAVSDK takeoff/land mission complete")
         return 0
 
     except asyncio.TimeoutError:
+        if land_requested:
+            log_state(
+                MissionState.LAND,
+                "MAVSDK timed out after land was requested; assuming land is in progress and exiting without safety-land retry",
+            )
+            log_state(MissionState.FINISH, "exiting after land request")
+            return 0
+
         print("Timed out while waiting for PX4 connection or vehicle health.")
-        print("Make sure PX4 SITL is running and MAVLink is available on udp://:14540.")
+        print(f"Make sure PX4 SITL is running and MAVLink is available on {args.system_address}.")
         await try_mavsdk_land(drone)
         return 1
     except Exception as exc:
+        if land_requested:
+            if is_grpc_disconnect_error(exc):
+                log_state(
+                    MissionState.LAND,
+                    f"MAVSDK connection closed after land was requested; exiting without safety-land retry: {exc}",
+                )
+            else:
+                log_state(
+                    MissionState.LAND,
+                    f"land request returned an error after it was issued; exiting without safety-land retry: {exc}",
+                )
+            log_state(MissionState.FINISH, "exiting after land request")
+            return 0
+
         print(f"MAVSDK mission failed: {exc}")
         await try_mavsdk_land(drone)
         return 1

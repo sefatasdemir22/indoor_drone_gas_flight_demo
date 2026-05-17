@@ -43,10 +43,10 @@ Terminal 2:
 
 ```bash
 cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
-python3 src/mission_manager.py --mode mavsdk --takeoff-altitude 1.5 --takeoff-timeout 25 --hover-seconds 5 --enable-short-move --move-forward-seconds 4 --move-forward-speed 0.5 --move-rate-hz 10 --connection-timeout 30
+python3 src/mission_manager.py --mode mavsdk --takeoff-altitude 1.5 --takeoff-timeout 25 --hover-seconds 5 --enable-short-move --move-north-speed 0.5 --move-east-speed 0.0 --move-forward-seconds 4 --move-rate-hz 10 --connection-timeout 30
 ```
 
-Bu test sadece kısa ve kontrollü ileri hareket içindir. Oda gezme, engelden kaçınma ve gaz ölçüm entegrasyonu sonraki aşamadadır.
+Bu test sadece kısa ve kontrollü NED velocity hareketi içindir. Oda gezme, engelden kaçınma ve gaz ölçüm entegrasyonu sonraki aşamadadır.
 
 ## Simulated Mission FSM
 
