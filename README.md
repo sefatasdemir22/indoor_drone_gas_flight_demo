@@ -129,3 +129,43 @@ Uretilen ROS2 live ciktilar:
 - `results/live_ros2_gas_heatmap.png`
 
 Not: Lidar/lazer sensorleri kaldirilmamistir; bu asamada kontrol dongusunde aktif kullanilmaz. Lidar tabanli guvenlik ve kacinma sonraki asamadir.
+
+## Safe Corridor Mission
+
+Bu gorev ilk otonom hareket prototipidir. Drone MAVSDK ile kalkis yapar, sabit yaw ile NED velocity adimlari gonderir, her adimdan sonra lokal pozisyonu loglar ve gorev sonunda iner.
+
+Bu script gaz olcumu uretmez; canli gaz haritalama ROS2 topic uzerinden ayri scriptle yapilir.
+
+Terminal 1:
+
+```bash
+cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
+./baslat.sh
+```
+
+Terminal 2:
+
+```bash
+python3 src/live_gas_mapping_ros2.py --scenario random --duration-seconds 30 --sample-rate-hz 5
+```
+
+Terminal 3:
+
+```bash
+cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
+python3 src/safe_corridor_mission.py
+```
+
+Varsayilan olarak on lazer guvenligi aciktir. Farkli yon, hiz ve step sayisi testleri icin argumanlar override edilebilir:
+
+```bash
+python3 src/safe_corridor_mission.py --east-speed 0.2 --step-count 4
+```
+
+On lazer guvenligini kapatmak icin:
+
+```bash
+python3 src/safe_corridor_mission.py --disable-front-safety
+```
+
+Bu ilk safety layer yalnizca on lazeri (`/drone/front_scan`) kullanir. Sag/sol lazerler ileride koridor hizalama icin kullanilacaktir.
