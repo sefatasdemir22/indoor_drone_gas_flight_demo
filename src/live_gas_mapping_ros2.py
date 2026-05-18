@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topic", default=DEFAULT_TOPIC)
     parser.add_argument("--vmin", type=float, default=0.0)
     parser.add_argument("--vmax", type=float, default=130.0)
+    parser.add_argument("--hide-source-marker", action="store_true", help="Hide ground-truth gas source markers in the rendered heatmap.")
+    parser.add_argument("--route-min-altitude", type=float, default=0.0, help="Only draw route/scatter samples with z altitude at or above this value.")
     parser.add_argument("--seed", type=int, default=None, help="Optional deterministic seed for gas scenario/noise.")
     parser.add_argument("--background-ppm", type=float, default=5.0)
     parser.add_argument("--peak-ppm", type=float, default=120.0)
@@ -56,7 +58,14 @@ def active_source_summary(active_sources: list[dict[str, Any]]) -> str:
     return ", ".join(f"{source['name']}({float(source['x']):.1f},{float(source['y']):.1f})" for source in active_sources)
 
 
-def render_heatmap(csv_path: Path, heatmap_path: Path, vmin: float, vmax: float) -> int:
+def render_heatmap(
+    csv_path: Path,
+    heatmap_path: Path,
+    vmin: float,
+    vmax: float,
+    hide_source_marker: bool,
+    route_min_altitude: float,
+) -> int:
     command = [
         sys.executable,
         str(PROJECT_DIR / "src" / "demo_tools" / "gas_mapper_node.py"),
@@ -68,7 +77,11 @@ def render_heatmap(csv_path: Path, heatmap_path: Path, vmin: float, vmax: float)
         str(vmin),
         "--vmax",
         str(vmax),
+        "--route-min-altitude",
+        str(route_min_altitude),
     ]
+    if hide_source_marker:
+        command.append("--hide-source-marker")
     return subprocess.call(command)
 
 
@@ -286,7 +299,14 @@ def main() -> int:
         print("[heatmap] not enough samples to render a heatmap")
         return 1
 
-    mapper_status = render_heatmap(csv_path, heatmap_path, args.vmin, args.vmax)
+    mapper_status = render_heatmap(
+        csv_path,
+        heatmap_path,
+        args.vmin,
+        args.vmax,
+        args.hide_source_marker,
+        args.route_min_altitude,
+    )
     if mapper_status == 0:
         print(f"[output] heatmap path: {heatmap_path}")
     else:

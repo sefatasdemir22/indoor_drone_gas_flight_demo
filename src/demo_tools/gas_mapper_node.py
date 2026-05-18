@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-size", type=int, default=90, help="Interpolation grid resolution per axis.")
     parser.add_argument("--vmin", type=float, default=0.0, help="Minimum ppm value for the fixed color scale.")
     parser.add_argument("--vmax", type=float, default=130.0, help="Maximum ppm value for the fixed color scale.")
+    parser.add_argument("--hide-source-marker", action="store_true", help="Hide ground-truth gas source markers in the rendered plot.")
+    parser.add_argument("--route-min-altitude", type=float, default=0.0, help="Only draw route/scatter samples with z altitude at or above this value.")
     return parser.parse_args()
 
 
@@ -78,6 +80,7 @@ def read_samples(csv_path: Path) -> list[dict[str, float | str | list[dict[str, 
                 {
                     "x": float(row["x"]),
                     "y": float(row["y"]),
+                    "z": float(row.get("z") or 0.0),
                     "ppm": float(row["ppm"]),
                     "scenario": row.get("scenario", row.get("active_zone", "single_source")),
                     "active_sources": parse_active_sources(row),
@@ -175,9 +178,17 @@ def main() -> int:
         return 1
 
     grid_xs, grid_ys, grid = idw_interpolate(samples, args.grid_size)
-    sample_xs = [float(row["x"]) for row in samples]
-    sample_ys = [float(row["y"]) for row in samples]
-    sample_ppm = [float(row["ppm"]) for row in samples]
+    route_min_altitude = max(0.0, args.route_min_altitude)
+    presentation_samples = [row for row in samples if float(row.get("z", 0.0)) >= route_min_altitude]
+    if not presentation_samples:
+        print(
+            f"[warning] No samples at or above route_min_altitude={route_min_altitude:.2f}; "
+            "drawing all samples instead."
+        )
+        presentation_samples = samples
+    sample_xs = [float(row["x"]) for row in presentation_samples]
+    sample_ys = [float(row["y"]) for row in presentation_samples]
+    sample_ppm = [float(row["ppm"]) for row in presentation_samples]
     scenario = str(samples[0].get("scenario", "unknown"))
     active_sources = samples[0]["active_sources"]
     if not isinstance(active_sources, list):
@@ -197,12 +208,12 @@ def main() -> int:
         vmax=args.vmax,
     )
     axis.scatter(sample_xs, sample_ys, c=sample_ppm, cmap="inferno", s=16, edgecolors="white", linewidths=0.25, vmin=args.vmin, vmax=args.vmax)
-    if active_sources:
+    if active_sources and not args.hide_source_marker:
         source_xs = [float(source["x"]) for source in active_sources]
         source_ys = [float(source["y"]) for source in active_sources]
         label = "active sources" if len(active_sources) > 1 else f"active source: {active_sources[0]['name']}"
         axis.scatter(source_xs, source_ys, marker="*", s=260, c="cyan", edgecolors="black", linewidths=0.8, label=label)
-    else:
+    elif not active_sources and not args.hide_source_marker:
         axis.scatter([], [], marker="*", s=260, c="cyan", edgecolors="black", linewidths=0.8, label="clean air / no active source")
     axis.scatter([0.0], [0.0], marker="s", s=95, c="#2f6fff", edgecolors="white", linewidths=0.8, label="START / SAFE_EXIT")
     axis.plot(sample_xs, sample_ys, color="white", linewidth=1.0, alpha=0.65, label="simulated route")
