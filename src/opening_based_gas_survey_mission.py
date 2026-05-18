@@ -204,6 +204,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--body-right-speed", type=float, default=0.0)
     parser.add_argument("--body-down-speed", type=float, default=0.0)
     parser.add_argument("--body-yawspeed", type=float, default=0.0)
+    parser.add_argument(
+        "--enable-opening-probe",
+        action="store_true",
+        help="After a left/right opening is detected during corridor follow, run one short lateral body-frame probe.",
+    )
+    parser.add_argument("--probe-side-speed", type=float, default=0.12)
+    parser.add_argument("--probe-duration-seconds", type=float, default=1.5)
+    parser.add_argument("--probe-max-count", type=int, default=1)
     parser.add_argument("--move-rate-hz", type=float, default=10.0)
     parser.add_argument("--pause-between-steps", type=float, default=0.75)
     parser.add_argument("--front-sector-deg", type=float, default=35.0)
@@ -1032,12 +1040,77 @@ def log_passive_corridor_decision(
     return decision
 
 
+def opening_side_for_decision(decision: Decision) -> str | None:
+    if decision == Decision.DETECT_LEFT_OPENING:
+        return "left"
+    if decision == Decision.DETECT_RIGHT_OPENING:
+        return "right"
+    return None
+
+
 async def send_zero_velocity(drone: object, velocity_type: object, yaw_deg: float) -> None:
     await drone.offboard.set_velocity_ned(velocity_type(0.0, 0.0, 0.0, yaw_deg))
 
 
 async def send_zero_body_velocity(drone: object, velocity_type: object) -> None:
     await drone.offboard.set_velocity_body(velocity_type(0.0, 0.0, 0.0, 0.0))
+
+
+async def run_opening_probe(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+    side: str,
+) -> None:
+    duration_sec = max(0.0, args.probe_duration_seconds)
+    rate_hz = max(1.0, args.move_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    side_speed = abs(float(args.probe_side_speed))
+    right_speed = -side_speed if side == "left" else side_speed
+
+    if duration_sec == 0.0 or side_speed == 0.0:
+        log("PROBE", f"skipping {side} opening probe because speed or duration is zero")
+        return
+
+    if not front_motion_allowed(monitor, args):
+        log("PROBE", f"front safety blocked before {side} opening probe")
+        return
+
+    start_position = await read_position_ned(drone, f"{side} probe start")
+    log(
+        "PROBE",
+        f"{side} opening lateral body probe: right_speed={right_speed:.2f} m/s, duration={duration_sec:.1f}s",
+    )
+
+    started_at = time.monotonic()
+    next_decision_log_at = started_at
+    decision_log_interval_sec = 1.0 / max(0.1, args.scan_log_rate_hz)
+    memory = MissionMemory(
+        visited_openings=set(),
+        skipped_openings=set(),
+        bypass_attempts=0,
+        corridor_x=0.0,
+        seed=args.seed if args.seed is not None else 0,
+    )
+    while time.monotonic() - started_at < duration_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        now = time.monotonic()
+        if now >= next_decision_log_at:
+            log_passive_corridor_decision(monitor, memory, args, f"probe side={side}")
+            next_decision_log_at = now + decision_log_interval_sec
+        if not front_motion_allowed(monitor, args):
+            log("PROBE", f"front safety stopped {side} opening probe")
+            await send_zero_body_velocity(drone, velocity_type)
+            return
+        await drone.offboard.set_velocity_body(velocity_type(0.0, right_speed, 0.0, 0.0))
+        await asyncio.sleep(interval_sec)
+
+    await send_zero_body_velocity(drone, velocity_type)
+    await asyncio.sleep(0.2)
+    end_position = await read_position_ned(drone, f"{side} probe end")
+    log_position_delta(f"{side} probe", end_position, start_position)
 
 
 async def warmup_offboard_ned(
@@ -1177,6 +1250,9 @@ async def run_body_corridor_follow_steps(
     down_speed = float(args.body_down_speed)
     yawspeed = float(args.body_yawspeed)
     decision_log_interval_sec = 1.0 / max(0.1, args.scan_log_rate_hz)
+    opening_probe_enabled = bool(args.enable_opening_probe)
+    max_probe_count = max(0, args.probe_max_count)
+    probe_count = 0
     memory = MissionMemory(
         visited_openings=set(),
         skipped_openings=set(),
@@ -1193,6 +1269,11 @@ async def run_body_corridor_follow_steps(
     log("MOVE", f"body_yawspeed={yawspeed:.2f} deg/s")
     log("MOVE", f"step_duration_seconds={step_duration_sec:.1f}")
     log("MOVE", f"move_rate_hz={rate_hz:.1f}")
+    log("PROBE", f"opening_probe_enabled={opening_probe_enabled}")
+    if opening_probe_enabled:
+        log("PROBE", f"probe_side_speed={abs(float(args.probe_side_speed)):.2f} m/s")
+        log("PROBE", f"probe_duration_seconds={max(0.0, args.probe_duration_seconds):.1f}")
+        log("PROBE", f"probe_max_count={max_probe_count}")
 
     if step_count == 0 or step_duration_sec == 0.0:
         log("MOVE", "corridor movement skipped because step count or duration is zero")
@@ -1208,7 +1289,13 @@ async def run_body_corridor_follow_steps(
         for step_index in range(step_count):
             tag = f"MOVE {step_index + 1}/{step_count}"
             rclpy.spin_once(monitor.node, timeout_sec=0.05)
-            log_passive_corridor_decision(monitor, memory, args, f"step={step_index + 1}/{step_count} pre")
+            decision = log_passive_corridor_decision(monitor, memory, args, f"step={step_index + 1}/{step_count} pre")
+            opening_side = opening_side_for_decision(decision)
+            if opening_probe_enabled and opening_side is not None and probe_count < max_probe_count:
+                probe_count += 1
+                await run_opening_probe(drone, rclpy, monitor, args, velocity_type, opening_side)
+                log("PROBE", "opening probe complete; ending corridor follow and landing")
+                return
             if not front_motion_allowed(monitor, args):
                 await send_zero_body_velocity(drone, velocity_type)
                 break
@@ -1225,13 +1312,19 @@ async def run_body_corridor_follow_steps(
                 rclpy.spin_once(monitor.node, timeout_sec=0.0)
                 now = time.monotonic()
                 if now >= next_decision_log_at:
-                    log_passive_corridor_decision(
+                    decision = log_passive_corridor_decision(
                         monitor,
                         memory,
                         args,
                         f"step={step_index + 1}/{step_count} moving",
                     )
                     next_decision_log_at = now + decision_log_interval_sec
+                    opening_side = opening_side_for_decision(decision)
+                    if opening_probe_enabled and opening_side is not None and probe_count < max_probe_count:
+                        probe_count += 1
+                        await run_opening_probe(drone, rclpy, monitor, args, velocity_type, opening_side)
+                        log("PROBE", "opening probe complete; ending corridor follow and landing")
+                        return
                 if not front_motion_allowed(monitor, args):
                     await send_zero_body_velocity(drone, velocity_type)
                     return
@@ -1250,13 +1343,19 @@ async def run_body_corridor_follow_steps(
                     rclpy.spin_once(monitor.node, timeout_sec=0.02)
                     now = time.monotonic()
                     if now >= next_decision_log_at:
-                        log_passive_corridor_decision(
+                        decision = log_passive_corridor_decision(
                             monitor,
                             memory,
                             args,
                             f"step={step_index + 1}/{step_count} pause",
                         )
                         next_decision_log_at = now + decision_log_interval_sec
+                        opening_side = opening_side_for_decision(decision)
+                        if opening_probe_enabled and opening_side is not None and probe_count < max_probe_count:
+                            probe_count += 1
+                            await run_opening_probe(drone, rclpy, monitor, args, velocity_type, opening_side)
+                            log("PROBE", "opening probe complete; ending corridor follow and landing")
+                            return
                     await asyncio.sleep(0.05)
     finally:
         try:
