@@ -69,8 +69,19 @@ Optional live gas mapping can be run in a separate terminal. This script does
 not command the drone:
 
 ```bash
-python3 src/live_gas_mapping_ros2.py --scenario random --duration-seconds 30 --sample-rate-hz 5
+python3 src/live_gas_mapping_ros2.py \
+  --scenario possible_gas_zone_4 \
+  --duration-seconds 30 \
+  --sample-rate-hz 5 \
+  --seed 1 \
+  --hide-source-marker \
+  --route-min-altitude 0.5
 ```
+
+The demo command uses `possible_gas_zone_4` as a deterministic gas scenario for
+a more repeatable presentation heatmap. It hides the ground-truth gas source
+marker and filters low-altitude takeoff samples from the route/scatter drawing
+only. CSV and JSON records remain unchanged.
 
 ## Dry-Run Checks
 
@@ -111,6 +122,14 @@ Expected dry-run behavior:
   those low floor obstacles.
 - Gas mapping is still separate from this mission script. The mission does not
   directly trigger gas samples or heatmap generation.
+- Debug heatmaps may show the ground-truth gas source marker. Demo heatmaps can
+  hide this marker so the plot does not imply that the drone already knows the
+  source location.
+- `--route-min-altitude` is only a visualization filter for the route/scatter
+  drawing. It does not remove samples from the raw CSV or scenario JSON.
+- `--scenario random`, `--scenario no_gas`, and `--scenario clean_air` are valid
+  robustness tests, but they can produce weak or no visible gas plume in a
+  presentation heatmap.
 
 ## Recommended Demo Flow
 
@@ -126,8 +145,24 @@ Expected dry-run behavior:
    decisions.
 5. Run corridor-follow with `--enable-opening-probe` to show that an opening
    decision can trigger a short lateral probe.
-6. Optionally run `live_gas_mapping_ros2.py` in another terminal to show the
-   separate gas mapping/heatmap pipeline.
+6. Run `live_gas_mapping_ros2.py` in another terminal before the mission when a
+   gas mapping demo is needed:
+
+   ```bash
+   python3 src/live_gas_mapping_ros2.py \
+     --scenario possible_gas_zone_4 \
+     --duration-seconds 30 \
+     --sample-rate-hz 5 \
+     --seed 1 \
+     --hide-source-marker \
+     --route-min-altitude 0.5
+   ```
+
+   Expected outputs:
+
+   - `results/live_ros2_gas_samples.csv`
+   - `results/live_ros2_scenario_info.json`
+   - `results/live_ros2_gas_heatmap.png`
 
 ## Next Phases
 
