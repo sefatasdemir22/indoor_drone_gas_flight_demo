@@ -1015,6 +1015,23 @@ def front_motion_allowed(monitor: LaserScanMonitor, args: argparse.Namespace) ->
     return True
 
 
+def log_passive_corridor_decision(
+    monitor: LaserScanMonitor,
+    memory: MissionMemory,
+    args: argparse.Namespace,
+    context: str,
+) -> Decision:
+    scan = monitor.snapshot()
+    decision = decide_corridor_action(scan, memory, args)
+    log_scan_monitor_snapshot(scan)
+    log("DECIDE", f"{context} corridor_action={decision.value}")
+    if decision == Decision.DETECT_LEFT_OPENING:
+        log("DETECT", f"{context} candidate opening side=left")
+    elif decision == Decision.DETECT_RIGHT_OPENING:
+        log("DETECT", f"{context} candidate opening side=right")
+    return decision
+
+
 async def send_zero_velocity(drone: object, velocity_type: object, yaw_deg: float) -> None:
     await drone.offboard.set_velocity_ned(velocity_type(0.0, 0.0, 0.0, yaw_deg))
 
@@ -1159,6 +1176,14 @@ async def run_body_corridor_follow_steps(
     right_speed = float(args.body_right_speed)
     down_speed = float(args.body_down_speed)
     yawspeed = float(args.body_yawspeed)
+    decision_log_interval_sec = 1.0 / max(0.1, args.scan_log_rate_hz)
+    memory = MissionMemory(
+        visited_openings=set(),
+        skipped_openings=set(),
+        bypass_attempts=0,
+        corridor_x=0.0,
+        seed=args.seed if args.seed is not None else 0,
+    )
 
     log("MOVE", "corridor follow check uses body-frame forward velocity")
     log("MOVE", f"step_count={step_count}")
@@ -1183,6 +1208,7 @@ async def run_body_corridor_follow_steps(
         for step_index in range(step_count):
             tag = f"MOVE {step_index + 1}/{step_count}"
             rclpy.spin_once(monitor.node, timeout_sec=0.05)
+            log_passive_corridor_decision(monitor, memory, args, f"step={step_index + 1}/{step_count} pre")
             if not front_motion_allowed(monitor, args):
                 await send_zero_body_velocity(drone, velocity_type)
                 break
@@ -1194,8 +1220,18 @@ async def run_body_corridor_follow_steps(
                 f"down={down_speed:.2f} m/s, yawspeed={yawspeed:.2f} deg/s",
             )
             step_started_at = time.monotonic()
+            next_decision_log_at = step_started_at
             while time.monotonic() - step_started_at < step_duration_sec:
                 rclpy.spin_once(monitor.node, timeout_sec=0.0)
+                now = time.monotonic()
+                if now >= next_decision_log_at:
+                    log_passive_corridor_decision(
+                        monitor,
+                        memory,
+                        args,
+                        f"step={step_index + 1}/{step_count} moving",
+                    )
+                    next_decision_log_at = now + decision_log_interval_sec
                 if not front_motion_allowed(monitor, args):
                     await send_zero_body_velocity(drone, velocity_type)
                     return
@@ -1212,6 +1248,15 @@ async def run_body_corridor_follow_steps(
                 pause_started_at = time.monotonic()
                 while time.monotonic() - pause_started_at < pause_sec:
                     rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                    now = time.monotonic()
+                    if now >= next_decision_log_at:
+                        log_passive_corridor_decision(
+                            monitor,
+                            memory,
+                            args,
+                            f"step={step_index + 1}/{step_count} pause",
+                        )
+                        next_decision_log_at = now + decision_log_interval_sec
                     await asyncio.sleep(0.05)
     finally:
         try:
