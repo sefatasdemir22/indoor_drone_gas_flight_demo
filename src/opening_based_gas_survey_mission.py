@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Dry-run skeleton for an opening-based gas survey mission.
+"""Opening-based gas survey mission prototype.
 
-This phase is intentionally simulation-only. It does not import MAVSDK, ROS2, or
-sensor message types, and it never commands a drone.
+Dry-run and scan-monitor modes never command a drone. The takeoff/land check
+mode imports MAVSDK lazily and only verifies scan readiness plus basic flight.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import math
 import random
 import time
 from dataclasses import dataclass
 from enum import Enum
+
+DEFAULT_SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
 
 
 class MissionState(str, Enum):
@@ -99,6 +102,13 @@ class MissionMemory:
     right_open_frames: int = 0
 
 
+@dataclass(frozen=True)
+class TakeoffAltitudeResult:
+    confirmed: bool
+    safe_hover_altitude: bool
+    last_altitude_m: float
+
+
 OPENING_CANDIDATES: tuple[OpeningCandidate, ...] = (
     OpeningCandidate("left_room_like_opening", corridor_x=5.0, side="left", opening_score=0.78),
     OpeningCandidate("right_room_like_opening", corridor_x=9.0, side="right", opening_score=0.72),
@@ -133,6 +143,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Read real ROS2 LaserScan topics and run decision logic without commanding the drone.",
     )
+    parser.add_argument(
+        "--takeoff-land-check",
+        action="store_true",
+        help="Wait for scan readiness, then run a MAVSDK takeoff/hover/land check. No corridor movement is commanded.",
+    )
     parser.add_argument("--dry-run-scenario", choices=DRY_RUN_SCENARIOS)
     parser.add_argument("--seed", type=int, default=None, help="Seed for repeatable dry-run decisions.")
     parser.add_argument("--max-openings", type=int, default=3)
@@ -153,6 +168,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scan-log-rate-hz", type=float, default=2.0)
     parser.add_argument("--scan-warmup-seconds", type=float, default=0.5)
     parser.add_argument("--scan-ready-timeout-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--skip-scan-ready-check",
+        action="store_true",
+        help="Skip the preflight front/left/right scan readiness gate in --takeoff-land-check mode.",
+    )
+    parser.add_argument(
+        "--system-address",
+        default=DEFAULT_SYSTEM_ADDRESS,
+        help=f"MAVSDK system address. Default: {DEFAULT_SYSTEM_ADDRESS}",
+    )
+    parser.add_argument("--connection-timeout", type=float, default=30.0)
+    parser.add_argument("--takeoff-altitude", type=float, default=1.2)
+    parser.add_argument("--takeoff-timeout", type=float, default=25.0)
+    parser.add_argument("--takeoff-altitude-tolerance", type=float, default=0.40)
+    parser.add_argument("--min-takeoff-confirm-altitude", type=float, default=0.75)
+    parser.add_argument("--post-takeoff-settle-seconds", type=float, default=2.0)
+    parser.add_argument("--pre-land-settle-seconds", type=float, default=0.75)
+    parser.add_argument("--hover-seconds", type=float, default=5.0)
     parser.add_argument("--return-home", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -506,6 +539,22 @@ def side_open_for_probe_confirm(scan: ScanSnapshot, side: str, args: argparse.Na
     return False
 
 
+def scan_ready_for_mission(scan: ScanSnapshot, args: argparse.Namespace) -> bool:
+    min_valid_samples = max(1, args.min_valid_samples)
+    min_valid_ratio = max(0.0, min(1.0, args.min_valid_ratio))
+    return (
+        scan.front_ready
+        and scan.left_ready
+        and scan.right_ready
+        and scan.front_valid_count >= min_valid_samples
+        and scan.left_valid_count >= min_valid_samples
+        and scan.right_valid_count >= min_valid_samples
+        and scan.front_valid_ratio >= min_valid_ratio
+        and scan.left_valid_ratio >= min_valid_ratio
+        and scan.right_valid_ratio >= min_valid_ratio
+    )
+
+
 def run_dry_run_scenario(args: argparse.Namespace, seed: int) -> int:
     scenario = args.dry_run_scenario
     if scenario is None:
@@ -625,6 +674,357 @@ def run_scan_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
+def import_ros2_scan_dependencies() -> tuple[object, object] | None:
+    try:
+        import rclpy
+        from sensor_msgs.msg import LaserScan
+    except Exception as exc:
+        print(f"Could not import ROS2 LaserScan dependencies: {exc}")
+        print("Make sure ROS2 Humble is sourced before using scan readiness checks.")
+        return None
+    return rclpy, LaserScan
+
+
+def import_mavsdk_system() -> object | None:
+    try:
+        from mavsdk import System
+    except Exception as exc:
+        print(f"Could not import MAVSDK: {exc}")
+        print("Make sure MAVSDK-Python is installed before using --takeoff-land-check.")
+        return None
+    return System
+
+
+def create_scan_monitor(args: argparse.Namespace) -> tuple[object, LaserScanMonitor] | None:
+    dependencies = import_ros2_scan_dependencies()
+    if dependencies is None:
+        return None
+
+    rclpy, laser_scan_type = dependencies
+    if not rclpy.ok():
+        rclpy.init()
+    return rclpy, LaserScanMonitor(rclpy, laser_scan_type, args)
+
+
+def close_scan_monitor(rclpy: object | None, monitor: LaserScanMonitor | None) -> None:
+    if monitor is not None:
+        monitor.close()
+    if rclpy is None:
+        return
+    try:
+        if rclpy.ok():
+            rclpy.shutdown()
+    except Exception as exc:
+        if "rcl_shutdown" not in str(exc) and "shutdown" not in str(exc).lower():
+            raise
+
+
+async def wait_for_scan_readiness(rclpy: object, monitor: LaserScanMonitor, args: argparse.Namespace) -> bool:
+    timeout_sec = max(0.1, args.scan_ready_timeout_seconds)
+    log_interval_sec = 1.0 / max(0.1, args.scan_log_rate_hz)
+    started_at = time.monotonic()
+    next_log_at = started_at
+
+    log("SCAN", f"waiting for scan readiness, timeout={timeout_sec:.1f}s")
+    while rclpy.ok() and time.monotonic() - started_at < timeout_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.05)
+        scan = monitor.snapshot()
+        if monitor.has_all_messages() and scan_ready_for_mission(scan, args):
+            log_scan_monitor_snapshot(scan)
+            log("SCAN", "front/left/right scan readiness confirmed")
+            return True
+
+        now = time.monotonic()
+        if now >= next_log_at:
+            log(
+                "SCAN",
+                "waiting for scan readiness: "
+                f"front_ready={monitor.latest_front is not None} "
+                f"left_ready={monitor.latest_left is not None} "
+                f"right_ready={monitor.latest_right is not None}",
+            )
+            next_log_at = now + log_interval_sec
+        await asyncio.sleep(0.02)
+
+    log("SCAN", "scan readiness timed out")
+    return False
+
+
+async def log_airborne_scan_checks(
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    memory: MissionMemory,
+    duration_sec: float,
+) -> None:
+    duration_sec = max(0.0, duration_sec)
+    if duration_sec == 0.0:
+        return
+
+    log_interval_sec = 1.0 / max(0.1, args.scan_log_rate_hz)
+    started_at = time.monotonic()
+    next_log_at = started_at
+    log("SCAN", f"airborne scan check during hover, duration={duration_sec:.1f}s")
+    while rclpy.ok() and time.monotonic() - started_at < duration_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.05)
+        now = time.monotonic()
+        if now < next_log_at:
+            await asyncio.sleep(0.02)
+            continue
+
+        scan = monitor.snapshot()
+        decision = decide_corridor_action(scan, memory, args)
+        log_scan_monitor_snapshot(scan)
+        log("DECIDE", f"corridor_action={decision.value}")
+        log("ACTION", action_message(decision))
+        next_log_at = now + log_interval_sec
+        await asyncio.sleep(0.02)
+
+
+async def wait_for_mavsdk_connection(drone: object, timeout_sec: float) -> None:
+    log("CONNECT", f"waiting for PX4 connection, timeout={timeout_sec:.1f}s")
+
+    async def _wait() -> None:
+        async for state in drone.core.connection_state():
+            if state.is_connected:
+                return
+
+    await asyncio.wait_for(_wait(), timeout=timeout_sec)
+    log("CONNECT", "PX4 connection established")
+
+
+async def wait_for_mavsdk_health(drone: object, timeout_sec: float) -> None:
+    log("CONNECT", f"waiting for vehicle health, timeout={timeout_sec:.1f}s")
+
+    async def _wait() -> None:
+        async for health in drone.telemetry.health():
+            log(
+                "CONNECT",
+                "health: "
+                f"global={health.is_global_position_ok}, "
+                f"local={health.is_local_position_ok}, "
+                f"home={health.is_home_position_ok}",
+            )
+            if health.is_global_position_ok and health.is_local_position_ok and health.is_home_position_ok:
+                return
+
+    await asyncio.wait_for(_wait(), timeout=timeout_sec)
+    log("CONNECT", "vehicle health checks passed")
+
+
+async def wait_until_takeoff_altitude(
+    drone: object,
+    target_altitude_m: float,
+    timeout_sec: float,
+    tolerance_m: float,
+    min_confirm_altitude_m: float,
+) -> TakeoffAltitudeResult:
+    target_altitude_m = max(0.0, target_altitude_m)
+    tolerance_m = max(0.05, tolerance_m)
+    min_confirm_altitude_m = max(0.05, min_confirm_altitude_m)
+    log(
+        "TAKEOFF",
+        "waiting for altitude "
+        f"target={target_altitude_m:.1f} m, tolerance={tolerance_m:.2f} m, "
+        f"min_confirm={min_confirm_altitude_m:.2f} m",
+    )
+    last_altitude_m = 0.0
+
+    async def _wait() -> TakeoffAltitudeResult:
+        nonlocal last_altitude_m
+        last_log_time = 0.0
+        async for position_velocity in drone.telemetry.position_velocity_ned():
+            altitude_estimate = abs(position_velocity.position.down_m)
+            last_altitude_m = altitude_estimate
+            now = time.monotonic()
+            if now - last_log_time >= 1.0:
+                log("TAKEOFF", f"current altitude estimate: {altitude_estimate:.2f} m")
+                last_log_time = now
+            target_band_reached = altitude_estimate >= max(0.0, target_altitude_m - tolerance_m)
+            safe_hover_altitude = altitude_estimate >= min_confirm_altitude_m
+            if target_band_reached and safe_hover_altitude:
+                return TakeoffAltitudeResult(
+                    confirmed=True,
+                    safe_hover_altitude=True,
+                    last_altitude_m=last_altitude_m,
+                )
+        return TakeoffAltitudeResult(
+            confirmed=False,
+            safe_hover_altitude=last_altitude_m >= min_confirm_altitude_m,
+            last_altitude_m=last_altitude_m,
+        )
+
+    try:
+        return await asyncio.wait_for(_wait(), timeout=max(0.1, timeout_sec))
+    except asyncio.TimeoutError:
+        log("TAKEOFF", "takeoff altitude wait timed out")
+        return TakeoffAltitudeResult(
+            confirmed=False,
+            safe_hover_altitude=last_altitude_m >= min_confirm_altitude_m,
+            last_altitude_m=last_altitude_m,
+        )
+    except Exception as exc:
+        log("TAKEOFF", f"takeoff altitude wait failed: {exc}")
+        return TakeoffAltitudeResult(confirmed=False, safe_hover_altitude=False, last_altitude_m=0.0)
+
+
+async def try_safety_land(drone: object) -> None:
+    try:
+        log("LAND", "attempting safety land")
+        await drone.action.land()
+    except Exception as exc:
+        log("LAND", f"safety land attempt failed: {exc}")
+
+
+def is_grpc_disconnect_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "grpc",
+            "channel",
+            "connection",
+            "socket",
+            "unavailable",
+            "connection reset",
+            "broken pipe",
+        )
+    )
+
+
+async def run_takeoff_land_check(args: argparse.Namespace) -> int:
+    system_type = import_mavsdk_system()
+    if system_type is None:
+        return 1
+
+    rclpy = None
+    monitor = None
+    if not args.skip_scan_ready_check:
+        monitor_bundle = create_scan_monitor(args)
+        if monitor_bundle is None:
+            return 1
+        rclpy, monitor = monitor_bundle
+
+    seed = args.seed if args.seed is not None else 0
+    memory = MissionMemory(
+        visited_openings=set(),
+        skipped_openings=set(),
+        bypass_attempts=0,
+        corridor_x=0.0,
+        seed=seed,
+    )
+    drone = system_type()
+    land_requested = False
+
+    log("CONFIG", "opening-based takeoff/land scan readiness check")
+    log("CONFIG", f"system_address={args.system_address}")
+    log("CONFIG", f"takeoff_altitude={args.takeoff_altitude:.1f} m")
+    log("CONFIG", f"takeoff_altitude_tolerance={args.takeoff_altitude_tolerance:.2f} m")
+    log("CONFIG", f"min_takeoff_confirm_altitude={args.min_takeoff_confirm_altitude:.2f} m")
+    log("CONFIG", f"post_takeoff_settle_seconds={max(0.0, args.post_takeoff_settle_seconds):.1f}")
+    log("CONFIG", f"hover_seconds={max(0.0, args.hover_seconds):.1f}")
+    log("CONFIG", f"pre_land_settle_seconds={max(0.0, args.pre_land_settle_seconds):.1f}")
+    log("CONFIG", f"scan_ready_check={not args.skip_scan_ready_check}")
+    log("CONFIG", f"front_scan_topic={args.front_scan_topic}")
+    log("CONFIG", f"left_scan_topic={args.left_scan_topic}")
+    log("CONFIG", f"right_scan_topic={args.right_scan_topic}")
+
+    try:
+        if monitor is not None and rclpy is not None:
+            scan_ready = await wait_for_scan_readiness(rclpy, monitor, args)
+            if not scan_ready:
+                log("FINISH", "aborting before MAVSDK connect because scan readiness failed")
+                return 1
+
+        log("CONNECT", f"connecting to MAVSDK system at {args.system_address}")
+        await asyncio.wait_for(drone.connect(system_address=args.system_address), timeout=args.connection_timeout)
+        await wait_for_mavsdk_connection(drone, args.connection_timeout)
+        await wait_for_mavsdk_health(drone, args.connection_timeout)
+
+        log("TAKEOFF", f"setting takeoff altitude to {args.takeoff_altitude:.1f} m")
+        await drone.action.set_takeoff_altitude(max(0.1, args.takeoff_altitude))
+        log("TAKEOFF", "arming")
+        await drone.action.arm()
+        log("TAKEOFF", "takeoff command sent")
+        await drone.action.takeoff()
+
+        altitude_result = await wait_until_takeoff_altitude(
+            drone,
+            target_altitude_m=args.takeoff_altitude,
+            timeout_sec=args.takeoff_timeout,
+            tolerance_m=args.takeoff_altitude_tolerance,
+            min_confirm_altitude_m=args.min_takeoff_confirm_altitude,
+        )
+        should_hover = altitude_result.confirmed or altitude_result.safe_hover_altitude
+        if altitude_result.confirmed:
+            log(
+                "TAKEOFF",
+                f"takeoff altitude confirmed at {altitude_result.last_altitude_m:.2f} m",
+            )
+        elif altitude_result.safe_hover_altitude:
+            log(
+                "TAKEOFF",
+                "target altitude was not fully confirmed, "
+                f"but safe hover altitude was reached at {altitude_result.last_altitude_m:.2f} m",
+            )
+        else:
+            log(
+                "TAKEOFF",
+                "takeoff altitude was not confirmed and safe hover altitude was not reached; "
+                f"last_altitude={altitude_result.last_altitude_m:.2f} m",
+            )
+
+        if should_hover:
+            settle_seconds = max(0.0, args.post_takeoff_settle_seconds)
+            if settle_seconds > 0.0:
+                log("TAKEOFF", f"settling after takeoff for {settle_seconds:.1f}s")
+                await asyncio.sleep(settle_seconds)
+
+        if monitor is not None and rclpy is not None and should_hover:
+            await log_airborne_scan_checks(rclpy, monitor, args, memory, args.hover_seconds)
+        elif should_hover:
+            hover_seconds = max(0.0, args.hover_seconds)
+            log("TAKEOFF", f"hovering without scan checks for {hover_seconds:.1f}s")
+            if hover_seconds > 0.0:
+                await asyncio.sleep(hover_seconds)
+        else:
+            log("TAKEOFF", "skipping hover scan checks and landing")
+
+        pre_land_settle_seconds = max(0.0, args.pre_land_settle_seconds)
+        if pre_land_settle_seconds > 0.0:
+            log("LAND", f"settling before land for {pre_land_settle_seconds:.1f}s")
+            await asyncio.sleep(pre_land_settle_seconds)
+
+        land_requested = True
+        log("LAND", "land command sent")
+        await drone.action.land()
+        log("FINISH", "takeoff/land scan readiness check complete")
+        return 0
+    except asyncio.TimeoutError:
+        log("FINISH", "timed out while waiting for PX4 connection or vehicle health")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 1
+    except KeyboardInterrupt:
+        log("FINISH", "interrupted by user")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 130
+    except Exception as exc:
+        if land_requested:
+            if is_grpc_disconnect_error(exc):
+                log("LAND", f"connection closed after land command; exiting calmly: {exc}")
+                return 0
+            log("LAND", f"land command was already sent; not retrying safety land: {exc}")
+            return 1
+
+        log("FINISH", f"mission failed before land command: {exc}")
+        await try_safety_land(drone)
+        return 1
+    finally:
+        close_scan_monitor(rclpy, monitor)
+
+
 def candidate_near_position(candidate: OpeningCandidate, corridor_x: float, step_size: float) -> bool:
     return abs(candidate.corridor_x - corridor_x) <= max(0.25, step_size / 2.0)
 
@@ -712,8 +1112,13 @@ def main() -> int:
     args = parse_args()
     if args.scan_monitor:
         return run_scan_monitor(args)
+    if args.takeoff_land_check:
+        return asyncio.run(run_takeoff_land_check(args))
     if not args.dry_run:
-        print("Use --dry-run for pure Python simulation or --scan-monitor for ROS2 LaserScan monitoring.")
+        print(
+            "Use --dry-run for pure Python simulation, --scan-monitor for ROS2 LaserScan monitoring, "
+            "or --takeoff-land-check for MAVSDK takeoff/land validation."
+        )
         return 2
     return run_dry_run(args)
 
