@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Opening-based gas survey mission prototype.
 
-Dry-run and scan-monitor modes never command a drone. The takeoff/land check
-mode imports MAVSDK lazily and only verifies scan readiness plus basic flight.
+Dry-run and scan-monitor modes never command a drone. MAVSDK modes import
+dependencies lazily and verify scan readiness before any flight command.
 """
 
 from __future__ import annotations
@@ -148,6 +148,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Wait for scan readiness, then run a MAVSDK takeoff/hover/land check. No corridor movement is commanded.",
     )
+    parser.add_argument(
+        "--corridor-follow-check",
+        action="store_true",
+        help="Run a low-speed body-frame forward movement check with front scan safety.",
+    )
+    parser.add_argument(
+        "--axis-calibration-check",
+        action="store_true",
+        help="Run offboard zero-hover plus short north/east NED pulses to identify the usable corridor axis.",
+    )
     parser.add_argument("--dry-run-scenario", choices=DRY_RUN_SCENARIOS)
     parser.add_argument("--seed", type=int, default=None, help="Seed for repeatable dry-run decisions.")
     parser.add_argument("--max-openings", type=int, default=3)
@@ -182,10 +192,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--takeoff-altitude", type=float, default=1.2)
     parser.add_argument("--takeoff-timeout", type=float, default=25.0)
     parser.add_argument("--takeoff-altitude-tolerance", type=float, default=0.40)
-    parser.add_argument("--min-takeoff-confirm-altitude", type=float, default=0.75)
+    parser.add_argument("--min-takeoff-confirm-altitude", type=float, default=0.70)
     parser.add_argument("--post-takeoff-settle-seconds", type=float, default=2.0)
     parser.add_argument("--pre-land-settle-seconds", type=float, default=0.75)
     parser.add_argument("--hover-seconds", type=float, default=5.0)
+    parser.add_argument("--corridor-step-count", type=int, default=3)
+    parser.add_argument("--corridor-step-duration-seconds", type=float, default=1.5)
+    parser.add_argument("--corridor-north-speed", type=float, default=0.15)
+    parser.add_argument("--corridor-east-speed", type=float, default=0.0)
+    parser.add_argument("--body-forward-speed", type=float, default=0.12)
+    parser.add_argument("--body-right-speed", type=float, default=0.0)
+    parser.add_argument("--body-down-speed", type=float, default=0.0)
+    parser.add_argument("--body-yawspeed", type=float, default=0.0)
+    parser.add_argument("--move-rate-hz", type=float, default=10.0)
+    parser.add_argument("--pause-between-steps", type=float, default=0.75)
+    parser.add_argument("--front-sector-deg", type=float, default=35.0)
+    parser.add_argument("--axis-calibration-speed", type=float, default=0.15)
+    parser.add_argument("--axis-calibration-duration", type=float, default=1.5)
+    parser.add_argument("--offboard-zero-hover-seconds", type=float, default=2.0)
+    parser.add_argument("--offboard-warmup-seconds", type=float, default=1.5)
     parser.add_argument("--return-home", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -695,6 +720,26 @@ def import_mavsdk_system() -> object | None:
     return System
 
 
+def import_velocity_ned_yaw() -> object | None:
+    try:
+        from mavsdk.offboard import VelocityNedYaw
+    except Exception as exc:
+        print(f"Could not import MAVSDK offboard velocity type: {exc}")
+        print("Make sure MAVSDK-Python offboard support is available before using --corridor-follow-check.")
+        return None
+    return VelocityNedYaw
+
+
+def import_velocity_body_yawspeed() -> object | None:
+    try:
+        from mavsdk.offboard import VelocityBodyYawspeed
+    except Exception as exc:
+        print(f"Could not import MAVSDK body velocity type: {exc}")
+        print("Make sure MAVSDK-Python offboard support is available before using --corridor-follow-check.")
+        return None
+    return VelocityBodyYawspeed
+
+
 def create_scan_monitor(args: argparse.Namespace) -> tuple[object, LaserScanMonitor] | None:
     dependencies = import_ros2_scan_dependencies()
     if dependencies is None:
@@ -876,6 +921,550 @@ async def try_safety_land(drone: object) -> None:
         log("LAND", f"safety land attempt failed: {exc}")
 
 
+async def read_initial_yaw_deg(drone: object) -> float:
+    try:
+        attitude = await asyncio.wait_for(anext(drone.telemetry.attitude_euler()), timeout=2.0)
+    except Exception as exc:
+        log("MOVE", f"could not read initial yaw; using 0.0 deg fallback: {exc}")
+        return 0.0
+
+    yaw_deg = float(attitude.yaw_deg)
+    log("MOVE", f"initial yaw={yaw_deg:.1f} deg")
+    return yaw_deg
+
+
+async def read_position_ned(drone: object, label: str) -> object | None:
+    try:
+        position_velocity = await asyncio.wait_for(anext(drone.telemetry.position_velocity_ned()), timeout=2.0)
+    except Exception as exc:
+        log("MOVE", f"could not read {label} local position NED: {exc}")
+        return None
+
+    position = position_velocity.position
+    log(
+        "MOVE",
+        f"{label} north/east/down: {position.north_m:.2f}, {position.east_m:.2f}, {position.down_m:.2f} m",
+    )
+    return position
+
+
+def log_position_delta(label: str, position: object | None, start_position: object | None) -> None:
+    if position is None or start_position is None:
+        log("MOVE", f"{label} displacement unavailable")
+        return
+
+    delta_north, delta_east, delta_down = position_delta(position, start_position)
+    log(
+        "MOVE",
+        f"{label} displacement from start: north={delta_north:.2f} m, east={delta_east:.2f} m, down={delta_down:.2f} m",
+    )
+
+
+def position_delta(position: object, start_position: object) -> tuple[float, float, float]:
+    delta_north = position.north_m - start_position.north_m
+    delta_east = position.east_m - start_position.east_m
+    delta_down = position.down_m - start_position.down_m
+    return delta_north, delta_east, delta_down
+
+
+def horizontal_magnitude(delta_north: float, delta_east: float) -> float:
+    return math.sqrt(delta_north * delta_north + delta_east * delta_east)
+
+
+def valid_laser_range(distance: float, msg: object) -> bool:
+    if not math.isfinite(distance) or distance <= 0.0:
+        return False
+    range_min = float(getattr(msg, "range_min", 0.0))
+    range_max = float(getattr(msg, "range_max", 0.0))
+    if range_min > 0.0 and distance < range_min:
+        return False
+    if range_max > 0.0 and distance > range_max:
+        return False
+    return True
+
+
+def front_sector_min_distance(msg: object | None, sector_deg: float) -> float | None:
+    if msg is None:
+        return None
+
+    sector_half_rad = math.radians(max(0.0, sector_deg) / 2.0)
+    angle = float(getattr(msg, "angle_min", 0.0))
+    angle_increment = float(getattr(msg, "angle_increment", 0.0))
+    valid_ranges: list[float] = []
+    for distance in getattr(msg, "ranges", []):
+        if abs(angle) <= sector_half_rad and valid_laser_range(float(distance), msg):
+            valid_ranges.append(float(distance))
+        angle += angle_increment
+
+    return min(valid_ranges) if valid_ranges else None
+
+
+def front_motion_allowed(monitor: LaserScanMonitor, args: argparse.Namespace) -> bool:
+    front_min = front_sector_min_distance(monitor.latest_front, args.front_sector_deg)
+    if front_min is None:
+        log("SAFETY", "front sector unavailable; stopping corridor motion")
+        return False
+
+    log("SAFETY", f"front_sector_min={front_min:.2f} m, sector={max(0.0, args.front_sector_deg):.1f} deg")
+    if front_min < max(0.0, args.front_stop_distance):
+        log("SAFETY", "front obstacle detected; stopping corridor motion")
+        return False
+
+    if front_min >= max(args.front_stop_distance, args.front_clear_distance):
+        log("SAFETY", "front sector clear")
+    return True
+
+
+async def send_zero_velocity(drone: object, velocity_type: object, yaw_deg: float) -> None:
+    await drone.offboard.set_velocity_ned(velocity_type(0.0, 0.0, 0.0, yaw_deg))
+
+
+async def send_zero_body_velocity(drone: object, velocity_type: object) -> None:
+    await drone.offboard.set_velocity_body(velocity_type(0.0, 0.0, 0.0, 0.0))
+
+
+async def warmup_offboard_ned(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    velocity_type: object,
+    yaw_deg: float,
+    args: argparse.Namespace,
+) -> None:
+    warmup_sec = max(0.0, args.offboard_warmup_seconds)
+    rate_hz = max(1.0, args.move_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    if warmup_sec == 0.0:
+        await send_zero_velocity(drone, velocity_type, yaw_deg)
+        return
+
+    log("MOVE", f"warming up NED offboard setpoints for {warmup_sec:.1f}s")
+    started_at = time.monotonic()
+    while time.monotonic() - started_at < warmup_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        await send_zero_velocity(drone, velocity_type, yaw_deg)
+        await asyncio.sleep(interval_sec)
+
+
+async def warmup_offboard_body(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    velocity_type: object,
+    args: argparse.Namespace,
+) -> None:
+    warmup_sec = max(0.0, args.offboard_warmup_seconds)
+    rate_hz = max(1.0, args.move_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    if warmup_sec == 0.0:
+        await send_zero_body_velocity(drone, velocity_type)
+        return
+
+    log("MOVE", f"warming up body offboard setpoints for {warmup_sec:.1f}s")
+    started_at = time.monotonic()
+    while time.monotonic() - started_at < warmup_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        await send_zero_body_velocity(drone, velocity_type)
+        await asyncio.sleep(interval_sec)
+
+
+async def run_corridor_follow_steps(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+    yaw_deg: float,
+) -> None:
+    step_count = max(0, args.corridor_step_count)
+    step_duration_sec = max(0.0, args.corridor_step_duration_seconds)
+    rate_hz = max(1.0, args.move_rate_hz)
+    pause_sec = max(0.0, args.pause_between_steps)
+    interval_sec = 1.0 / rate_hz
+    north_speed = float(args.corridor_north_speed)
+    east_speed = float(args.corridor_east_speed)
+
+    log("MOVE", "corridor follow check uses fixed yaw and NED velocity")
+    log("MOVE", f"step_count={step_count}")
+    log("MOVE", f"north_speed={north_speed:.2f} m/s")
+    log("MOVE", f"east_speed={east_speed:.2f} m/s")
+    log("MOVE", f"step_duration_seconds={step_duration_sec:.1f}")
+    log("MOVE", f"move_rate_hz={rate_hz:.1f}")
+
+    if step_count == 0 or step_duration_sec == 0.0:
+        log("MOVE", "corridor movement skipped because step count or duration is zero")
+        return
+
+    start_position = await read_position_ned(drone, "start")
+
+    await warmup_offboard_ned(drone, rclpy, monitor, velocity_type, yaw_deg, args)
+    log("MOVE", "starting offboard mode")
+    await drone.offboard.start()
+
+    try:
+        for step_index in range(step_count):
+            tag = f"MOVE {step_index + 1}/{step_count}"
+            rclpy.spin_once(monitor.node, timeout_sec=0.05)
+            if not front_motion_allowed(monitor, args):
+                await send_zero_velocity(drone, velocity_type, yaw_deg)
+                break
+
+            log(
+                tag,
+                f"NED velocity: north={north_speed:.2f} m/s, east={east_speed:.2f} m/s, yaw={yaw_deg:.1f} deg",
+            )
+            step_started_at = time.monotonic()
+            while time.monotonic() - step_started_at < step_duration_sec:
+                rclpy.spin_once(monitor.node, timeout_sec=0.0)
+                if not front_motion_allowed(monitor, args):
+                    await send_zero_velocity(drone, velocity_type, yaw_deg)
+                    return
+                await drone.offboard.set_velocity_ned(velocity_type(north_speed, east_speed, 0.0, yaw_deg))
+                await asyncio.sleep(interval_sec)
+
+            await send_zero_velocity(drone, velocity_type, yaw_deg)
+            end_position = await read_position_ned(drone, f"after step {step_index + 1}")
+            log_position_delta(f"step {step_index + 1}", end_position, start_position)
+            if pause_sec > 0.0:
+                log(tag, f"pausing for {pause_sec:.1f}s")
+                pause_started_at = time.monotonic()
+                while time.monotonic() - pause_started_at < pause_sec:
+                    rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                    await asyncio.sleep(0.05)
+    finally:
+        try:
+            await send_zero_velocity(drone, velocity_type, yaw_deg)
+        except Exception as exc:
+            log("MOVE", f"zero velocity before offboard stop failed: {exc}")
+        try:
+            log("MOVE", "stopping offboard mode")
+            await drone.offboard.stop()
+        except Exception as exc:
+            log("MOVE", f"offboard stop failed, continuing to land: {exc}")
+
+
+async def run_body_corridor_follow_steps(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+) -> None:
+    step_count = max(0, args.corridor_step_count)
+    step_duration_sec = max(0.0, args.corridor_step_duration_seconds)
+    rate_hz = max(1.0, args.move_rate_hz)
+    pause_sec = max(0.0, args.pause_between_steps)
+    interval_sec = 1.0 / rate_hz
+    forward_speed = float(args.body_forward_speed)
+    right_speed = float(args.body_right_speed)
+    down_speed = float(args.body_down_speed)
+    yawspeed = float(args.body_yawspeed)
+
+    log("MOVE", "corridor follow check uses body-frame forward velocity")
+    log("MOVE", f"step_count={step_count}")
+    log("MOVE", f"body_forward_speed={forward_speed:.2f} m/s")
+    log("MOVE", f"body_right_speed={right_speed:.2f} m/s")
+    log("MOVE", f"body_down_speed={down_speed:.2f} m/s")
+    log("MOVE", f"body_yawspeed={yawspeed:.2f} deg/s")
+    log("MOVE", f"step_duration_seconds={step_duration_sec:.1f}")
+    log("MOVE", f"move_rate_hz={rate_hz:.1f}")
+
+    if step_count == 0 or step_duration_sec == 0.0:
+        log("MOVE", "corridor movement skipped because step count or duration is zero")
+        return
+
+    start_position = await read_position_ned(drone, "start")
+
+    await warmup_offboard_body(drone, rclpy, monitor, velocity_type, args)
+    log("MOVE", "starting offboard mode")
+    await drone.offboard.start()
+
+    try:
+        for step_index in range(step_count):
+            tag = f"MOVE {step_index + 1}/{step_count}"
+            rclpy.spin_once(monitor.node, timeout_sec=0.05)
+            if not front_motion_allowed(monitor, args):
+                await send_zero_body_velocity(drone, velocity_type)
+                break
+
+            log(
+                tag,
+                "body velocity: "
+                f"forward={forward_speed:.2f} m/s, right={right_speed:.2f} m/s, "
+                f"down={down_speed:.2f} m/s, yawspeed={yawspeed:.2f} deg/s",
+            )
+            step_started_at = time.monotonic()
+            while time.monotonic() - step_started_at < step_duration_sec:
+                rclpy.spin_once(monitor.node, timeout_sec=0.0)
+                if not front_motion_allowed(monitor, args):
+                    await send_zero_body_velocity(drone, velocity_type)
+                    return
+                await drone.offboard.set_velocity_body(
+                    velocity_type(forward_speed, right_speed, down_speed, yawspeed)
+                )
+                await asyncio.sleep(interval_sec)
+
+            await send_zero_body_velocity(drone, velocity_type)
+            end_position = await read_position_ned(drone, f"after step {step_index + 1}")
+            log_position_delta(f"step {step_index + 1}", end_position, start_position)
+            if pause_sec > 0.0:
+                log(tag, f"pausing for {pause_sec:.1f}s")
+                pause_started_at = time.monotonic()
+                while time.monotonic() - pause_started_at < pause_sec:
+                    rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                    await asyncio.sleep(0.05)
+    finally:
+        try:
+            await send_zero_body_velocity(drone, velocity_type)
+        except Exception as exc:
+            log("MOVE", f"body zero velocity before offboard stop failed: {exc}")
+        try:
+            log("MOVE", "stopping offboard mode")
+            await drone.offboard.stop()
+        except Exception as exc:
+            log("MOVE", f"offboard stop failed, continuing to land: {exc}")
+
+
+async def stream_zero_hover(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    velocity_type: object,
+    yaw_deg: float,
+    duration_sec: float,
+    rate_hz: float,
+) -> tuple[float, float] | None:
+    duration_sec = max(0.0, duration_sec)
+    rate_hz = max(1.0, rate_hz)
+    interval_sec = 1.0 / rate_hz
+    if duration_sec == 0.0:
+        return None
+
+    start_position = await read_position_ned(drone, "zero-hover start")
+    started_at = time.monotonic()
+    while time.monotonic() - started_at < duration_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        await send_zero_velocity(drone, velocity_type, yaw_deg)
+        await asyncio.sleep(interval_sec)
+
+    end_position = await read_position_ned(drone, "zero-hover end")
+    if start_position is None or end_position is None:
+        log("CALIBRATE", "zero-hover drift unavailable")
+        return None
+
+    delta_north, delta_east, delta_down = position_delta(end_position, start_position)
+    drift = horizontal_magnitude(delta_north, delta_east)
+    log(
+        "CALIBRATE",
+        f"zero-hover drift: north={delta_north:.2f} m, east={delta_east:.2f} m, "
+        f"down={delta_down:.2f} m, horizontal={drift:.2f} m",
+    )
+    return delta_north, delta_east
+
+
+async def run_axis_calibration_pulse(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+    yaw_deg: float,
+    label: str,
+    north_speed: float,
+    east_speed: float,
+) -> tuple[float, float] | None:
+    duration_sec = max(0.0, args.axis_calibration_duration)
+    rate_hz = max(1.0, args.move_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    if duration_sec == 0.0:
+        log("CALIBRATE", f"{label} pulse skipped because duration is zero")
+        return None
+
+    start_position = await read_position_ned(drone, f"{label} pulse start")
+    log(
+        "CALIBRATE",
+        f"{label} pulse: north={north_speed:.2f} m/s, east={east_speed:.2f} m/s, duration={duration_sec:.1f}s",
+    )
+
+    started_at = time.monotonic()
+    next_front_log_at = started_at
+    while time.monotonic() - started_at < duration_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        now = time.monotonic()
+        if now >= next_front_log_at:
+            front_min = front_sector_min_distance(monitor.latest_front, args.front_sector_deg)
+            front_text = "unavailable" if front_min is None else f"{front_min:.2f} m"
+            log("CALIBRATE", f"{label} front_sector_min={front_text}")
+            next_front_log_at = now + 0.5
+        await drone.offboard.set_velocity_ned(velocity_type(north_speed, east_speed, 0.0, yaw_deg))
+        await asyncio.sleep(interval_sec)
+
+    await send_zero_velocity(drone, velocity_type, yaw_deg)
+    await asyncio.sleep(0.2)
+    end_position = await read_position_ned(drone, f"{label} pulse end")
+    if start_position is None or end_position is None:
+        log("CALIBRATE", f"{label} pulse displacement unavailable")
+        return None
+
+    delta_north, delta_east, delta_down = position_delta(end_position, start_position)
+    log(
+        "CALIBRATE",
+        f"{label} pulse displacement: north={delta_north:.2f} m, east={delta_east:.2f} m, down={delta_down:.2f} m",
+    )
+    return delta_north, delta_east
+
+
+async def run_body_axis_calibration_pulse(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+) -> tuple[float, float] | None:
+    duration_sec = max(0.0, args.axis_calibration_duration)
+    rate_hz = max(1.0, args.move_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    forward_speed = float(args.body_forward_speed)
+    right_speed = float(args.body_right_speed)
+    down_speed = float(args.body_down_speed)
+    yawspeed = float(args.body_yawspeed)
+    if duration_sec == 0.0:
+        log("CALIBRATE", "body-forward pulse skipped because duration is zero")
+        return None
+
+    start_position = await read_position_ned(drone, "body-forward pulse start")
+    log(
+        "CALIBRATE",
+        "body-forward pulse: "
+        f"forward={forward_speed:.2f} m/s, right={right_speed:.2f} m/s, "
+        f"down={down_speed:.2f} m/s, yawspeed={yawspeed:.2f} deg/s, duration={duration_sec:.1f}s",
+    )
+
+    started_at = time.monotonic()
+    next_front_log_at = started_at
+    while time.monotonic() - started_at < duration_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        now = time.monotonic()
+        if now >= next_front_log_at:
+            front_min = front_sector_min_distance(monitor.latest_front, args.front_sector_deg)
+            front_text = "unavailable" if front_min is None else f"{front_min:.2f} m"
+            log("CALIBRATE", f"body-forward front_sector_min={front_text}")
+            next_front_log_at = now + 0.5
+        await drone.offboard.set_velocity_body(
+            velocity_type(forward_speed, right_speed, down_speed, yawspeed)
+        )
+        await asyncio.sleep(interval_sec)
+
+    await send_zero_body_velocity(drone, velocity_type)
+    await asyncio.sleep(0.2)
+    end_position = await read_position_ned(drone, "body-forward pulse end")
+    if start_position is None or end_position is None:
+        log("CALIBRATE", "body-forward pulse displacement unavailable")
+        return None
+
+    delta_north, delta_east, delta_down = position_delta(end_position, start_position)
+    log(
+        "CALIBRATE",
+        f"body-forward pulse displacement: north={delta_north:.2f} m, east={delta_east:.2f} m, down={delta_down:.2f} m",
+    )
+    return delta_north, delta_east
+
+
+def recommend_corridor_axis(
+    north_result: tuple[float, float] | None,
+    east_result: tuple[float, float] | None,
+) -> str:
+    if north_result is None or east_result is None:
+        return "unknown"
+
+    north_magnitude = horizontal_magnitude(*north_result)
+    east_magnitude = horizontal_magnitude(*east_result)
+    if north_magnitude < 0.05 and east_magnitude < 0.05:
+        return "unknown"
+    if east_magnitude > north_magnitude * 1.25:
+        return "east"
+    if north_magnitude > east_magnitude * 1.25:
+        return "north"
+    return "unknown"
+
+
+async def run_axis_calibration_steps(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    ned_velocity_type: object,
+    body_velocity_type: object,
+    yaw_deg: float,
+) -> None:
+    speed = max(0.0, args.axis_calibration_speed)
+    rate_hz = max(1.0, args.move_rate_hz)
+
+    await warmup_offboard_ned(drone, rclpy, monitor, ned_velocity_type, yaw_deg, args)
+    log("CALIBRATE", "starting offboard mode")
+    await drone.offboard.start()
+
+    try:
+        zero_drift = await stream_zero_hover(
+            drone,
+            rclpy,
+            monitor,
+            ned_velocity_type,
+            yaw_deg,
+            args.offboard_zero_hover_seconds,
+            rate_hz,
+        )
+        north_result = await run_axis_calibration_pulse(
+            drone,
+            rclpy,
+            monitor,
+            args,
+            ned_velocity_type,
+            yaw_deg,
+            "north",
+            speed,
+            0.0,
+        )
+        east_result = await run_axis_calibration_pulse(
+            drone,
+            rclpy,
+            monitor,
+            args,
+            ned_velocity_type,
+            yaw_deg,
+            "east",
+            0.0,
+            speed,
+        )
+        body_result = await run_body_axis_calibration_pulse(
+            drone,
+            rclpy,
+            monitor,
+            args,
+            body_velocity_type,
+        )
+
+        if zero_drift is not None:
+            log("CALIBRATE", f"zero-hover summary: north={zero_drift[0]:.2f} m, east={zero_drift[1]:.2f} m")
+        if north_result is not None:
+            log("CALIBRATE", f"north pulse summary: north={north_result[0]:.2f} m, east={north_result[1]:.2f} m")
+        if east_result is not None:
+            log("CALIBRATE", f"east pulse summary: north={east_result[0]:.2f} m, east={east_result[1]:.2f} m")
+        if body_result is not None:
+            log("CALIBRATE", f"body-forward pulse summary: north={body_result[0]:.2f} m, east={body_result[1]:.2f} m")
+        log("CALIBRATE", f"recommended_corridor_axis={recommend_corridor_axis(north_result, east_result)}")
+    finally:
+        try:
+            await send_zero_velocity(drone, ned_velocity_type, yaw_deg)
+        except Exception as exc:
+            log("CALIBRATE", f"zero velocity before offboard stop failed: {exc}")
+        try:
+            log("CALIBRATE", "stopping offboard mode")
+            await drone.offboard.stop()
+        except Exception as exc:
+            log("CALIBRATE", f"offboard stop failed, continuing to land: {exc}")
+
+
 def is_grpc_disconnect_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return any(
@@ -1025,6 +1614,301 @@ async def run_takeoff_land_check(args: argparse.Namespace) -> int:
         close_scan_monitor(rclpy, monitor)
 
 
+async def run_corridor_follow_check(args: argparse.Namespace) -> int:
+    system_type = import_mavsdk_system()
+    velocity_type = import_velocity_body_yawspeed()
+    if system_type is None or velocity_type is None:
+        return 1
+
+    monitor_bundle = create_scan_monitor(args)
+    if monitor_bundle is None:
+        return 1
+    rclpy, monitor = monitor_bundle
+
+    drone = system_type()
+    land_requested = False
+    offboard_started = False
+
+    log("CONFIG", "opening-based corridor follow check")
+    log("CONFIG", f"system_address={args.system_address}")
+    log("CONFIG", f"takeoff_altitude={args.takeoff_altitude:.1f} m")
+    log("CONFIG", f"takeoff_altitude_tolerance={args.takeoff_altitude_tolerance:.2f} m")
+    log("CONFIG", f"min_takeoff_confirm_altitude={args.min_takeoff_confirm_altitude:.2f} m")
+    log("CONFIG", f"post_takeoff_settle_seconds={max(0.0, args.post_takeoff_settle_seconds):.1f}")
+    log("CONFIG", f"pre_land_settle_seconds={max(0.0, args.pre_land_settle_seconds):.1f}")
+    log("CONFIG", f"corridor_step_count={max(0, args.corridor_step_count)}")
+    log("CONFIG", f"corridor_step_duration_seconds={max(0.0, args.corridor_step_duration_seconds):.1f}")
+    log("CONFIG", f"body_forward_speed={args.body_forward_speed:.2f} m/s")
+    log("CONFIG", f"body_right_speed={args.body_right_speed:.2f} m/s")
+    log("CONFIG", f"body_down_speed={args.body_down_speed:.2f} m/s")
+    log("CONFIG", f"body_yawspeed={args.body_yawspeed:.2f} deg/s")
+    log("CONFIG", f"front_stop_distance={args.front_stop_distance:.2f} m")
+    log("CONFIG", f"front_clear_distance={args.front_clear_distance:.2f} m")
+    log("CONFIG", f"front_sector_deg={args.front_sector_deg:.1f}")
+    log("CONFIG", f"front_scan_topic={args.front_scan_topic}")
+
+    try:
+        scan_ready = await wait_for_scan_readiness(rclpy, monitor, args)
+        if not scan_ready:
+            log("FINISH", "aborting before MAVSDK connect because scan readiness failed")
+            return 1
+
+        log("CONNECT", f"connecting to MAVSDK system at {args.system_address}")
+        await asyncio.wait_for(drone.connect(system_address=args.system_address), timeout=args.connection_timeout)
+        await wait_for_mavsdk_connection(drone, args.connection_timeout)
+        await wait_for_mavsdk_health(drone, args.connection_timeout)
+
+        log("TAKEOFF", f"setting takeoff altitude to {args.takeoff_altitude:.1f} m")
+        await drone.action.set_takeoff_altitude(max(0.1, args.takeoff_altitude))
+        log("TAKEOFF", "arming")
+        await drone.action.arm()
+        log("TAKEOFF", "takeoff command sent")
+        await drone.action.takeoff()
+
+        altitude_result = await wait_until_takeoff_altitude(
+            drone,
+            target_altitude_m=args.takeoff_altitude,
+            timeout_sec=args.takeoff_timeout,
+            tolerance_m=args.takeoff_altitude_tolerance,
+            min_confirm_altitude_m=args.min_takeoff_confirm_altitude,
+        )
+        should_move = altitude_result.confirmed or altitude_result.safe_hover_altitude
+        if altitude_result.confirmed:
+            log("TAKEOFF", f"takeoff altitude confirmed at {altitude_result.last_altitude_m:.2f} m")
+        elif altitude_result.safe_hover_altitude:
+            log(
+                "TAKEOFF",
+                "target altitude was not fully confirmed, "
+                f"but safe hover altitude was reached at {altitude_result.last_altitude_m:.2f} m",
+            )
+        else:
+            log(
+                "TAKEOFF",
+                "takeoff altitude was not confirmed and safe hover altitude was not reached; "
+                f"last_altitude={altitude_result.last_altitude_m:.2f} m",
+            )
+
+        if should_move:
+            settle_seconds = max(0.0, args.post_takeoff_settle_seconds)
+            if settle_seconds > 0.0:
+                log("TAKEOFF", f"settling after takeoff for {settle_seconds:.1f}s")
+                settle_started_at = time.monotonic()
+                while time.monotonic() - settle_started_at < settle_seconds:
+                    rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                    await asyncio.sleep(0.05)
+
+            yaw_deg = await read_initial_yaw_deg(drone)
+            log("MOVE", f"front safety is aligned with body forward direction; initial_yaw={yaw_deg:.1f} deg")
+            offboard_started = True
+            await run_body_corridor_follow_steps(drone, rclpy, monitor, args, velocity_type)
+            offboard_started = False
+        else:
+            log("MOVE", "skipping corridor movement and landing")
+
+        pre_land_settle_seconds = max(0.0, args.pre_land_settle_seconds)
+        if pre_land_settle_seconds > 0.0:
+            log("LAND", f"settling before land for {pre_land_settle_seconds:.1f}s")
+            settle_started_at = time.monotonic()
+            while time.monotonic() - settle_started_at < pre_land_settle_seconds:
+                rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                await asyncio.sleep(0.05)
+
+        land_requested = True
+        log("LAND", "land command sent")
+        await drone.action.land()
+        log("FINISH", "corridor follow check complete")
+        return 0
+    except asyncio.TimeoutError:
+        log("FINISH", "timed out while waiting for PX4 connection or vehicle health")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("MOVE", f"offboard stop during timeout cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 1
+    except KeyboardInterrupt:
+        log("FINISH", "interrupted by user")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("MOVE", f"offboard stop during interrupt cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 130
+    except Exception as exc:
+        if land_requested:
+            if is_grpc_disconnect_error(exc):
+                log("LAND", f"connection closed after land command; exiting calmly: {exc}")
+                return 0
+            log("LAND", f"land command was already sent; not retrying safety land: {exc}")
+            return 1
+
+        log("FINISH", f"mission failed before land command: {exc}")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as stop_exc:
+                log("MOVE", f"offboard stop during error cleanup failed: {stop_exc}")
+        await try_safety_land(drone)
+        return 1
+    finally:
+        close_scan_monitor(rclpy, monitor)
+
+
+async def run_axis_calibration_check(args: argparse.Namespace) -> int:
+    system_type = import_mavsdk_system()
+    ned_velocity_type = import_velocity_ned_yaw()
+    body_velocity_type = import_velocity_body_yawspeed()
+    if system_type is None or ned_velocity_type is None or body_velocity_type is None:
+        return 1
+
+    monitor_bundle = create_scan_monitor(args)
+    if monitor_bundle is None:
+        return 1
+    rclpy, monitor = monitor_bundle
+
+    drone = system_type()
+    land_requested = False
+    offboard_started = False
+
+    log("CONFIG", "opening-based axis calibration check")
+    log("CONFIG", f"system_address={args.system_address}")
+    log("CONFIG", f"takeoff_altitude={args.takeoff_altitude:.1f} m")
+    log("CONFIG", f"takeoff_altitude_tolerance={args.takeoff_altitude_tolerance:.2f} m")
+    log("CONFIG", f"min_takeoff_confirm_altitude={args.min_takeoff_confirm_altitude:.2f} m")
+    log("CONFIG", f"post_takeoff_settle_seconds={max(0.0, args.post_takeoff_settle_seconds):.1f}")
+    log("CONFIG", f"offboard_zero_hover_seconds={max(0.0, args.offboard_zero_hover_seconds):.1f}")
+    log("CONFIG", f"axis_calibration_speed={max(0.0, args.axis_calibration_speed):.2f} m/s")
+    log("CONFIG", f"axis_calibration_duration={max(0.0, args.axis_calibration_duration):.1f}")
+    log("CONFIG", f"body_forward_speed={args.body_forward_speed:.2f} m/s")
+    log("CONFIG", f"offboard_warmup_seconds={max(0.0, args.offboard_warmup_seconds):.1f}")
+    log("CONFIG", f"move_rate_hz={max(1.0, args.move_rate_hz):.1f}")
+    log("CONFIG", f"front_sector_deg={args.front_sector_deg:.1f}")
+    log("CONFIG", f"front_scan_topic={args.front_scan_topic}")
+    log("CONFIG", "this mode diagnoses axes only; it does not perform corridor following")
+
+    try:
+        scan_ready = await wait_for_scan_readiness(rclpy, monitor, args)
+        if not scan_ready:
+            log("FINISH", "aborting before MAVSDK connect because scan readiness failed")
+            return 1
+
+        log("CONNECT", f"connecting to MAVSDK system at {args.system_address}")
+        await asyncio.wait_for(drone.connect(system_address=args.system_address), timeout=args.connection_timeout)
+        await wait_for_mavsdk_connection(drone, args.connection_timeout)
+        await wait_for_mavsdk_health(drone, args.connection_timeout)
+
+        log("TAKEOFF", f"setting takeoff altitude to {args.takeoff_altitude:.1f} m")
+        await drone.action.set_takeoff_altitude(max(0.1, args.takeoff_altitude))
+        log("TAKEOFF", "arming")
+        await drone.action.arm()
+        log("TAKEOFF", "takeoff command sent")
+        await drone.action.takeoff()
+
+        altitude_result = await wait_until_takeoff_altitude(
+            drone,
+            target_altitude_m=args.takeoff_altitude,
+            timeout_sec=args.takeoff_timeout,
+            tolerance_m=args.takeoff_altitude_tolerance,
+            min_confirm_altitude_m=args.min_takeoff_confirm_altitude,
+        )
+        should_calibrate = altitude_result.confirmed or altitude_result.safe_hover_altitude
+        if altitude_result.confirmed:
+            log("TAKEOFF", f"takeoff altitude confirmed at {altitude_result.last_altitude_m:.2f} m")
+        elif altitude_result.safe_hover_altitude:
+            log(
+                "TAKEOFF",
+                "target altitude was not fully confirmed, "
+                f"but safe hover altitude was reached at {altitude_result.last_altitude_m:.2f} m",
+            )
+        else:
+            log(
+                "TAKEOFF",
+                "takeoff altitude was not confirmed and safe hover altitude was not reached; "
+                f"last_altitude={altitude_result.last_altitude_m:.2f} m",
+            )
+
+        if should_calibrate:
+            settle_seconds = max(0.0, args.post_takeoff_settle_seconds)
+            if settle_seconds > 0.0:
+                log("TAKEOFF", f"settling after takeoff for {settle_seconds:.1f}s")
+                settle_started_at = time.monotonic()
+                while time.monotonic() - settle_started_at < settle_seconds:
+                    rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                    await asyncio.sleep(0.05)
+
+            yaw_deg = await read_initial_yaw_deg(drone)
+            log("CALIBRATE", f"initial_yaw={yaw_deg:.1f} deg")
+            offboard_started = True
+            await run_axis_calibration_steps(
+                drone,
+                rclpy,
+                monitor,
+                args,
+                ned_velocity_type,
+                body_velocity_type,
+                yaw_deg,
+            )
+            offboard_started = False
+        else:
+            log("CALIBRATE", "skipping axis calibration and landing")
+
+        pre_land_settle_seconds = max(0.0, args.pre_land_settle_seconds)
+        if pre_land_settle_seconds > 0.0:
+            log("LAND", f"settling before land for {pre_land_settle_seconds:.1f}s")
+            settle_started_at = time.monotonic()
+            while time.monotonic() - settle_started_at < pre_land_settle_seconds:
+                rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                await asyncio.sleep(0.05)
+
+        land_requested = True
+        log("LAND", "land command sent")
+        await drone.action.land()
+        log("FINISH", "axis calibration check complete")
+        return 0
+    except asyncio.TimeoutError:
+        log("FINISH", "timed out while waiting for PX4 connection or vehicle health")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("CALIBRATE", f"offboard stop during timeout cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 1
+    except KeyboardInterrupt:
+        log("FINISH", "interrupted by user")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("CALIBRATE", f"offboard stop during interrupt cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 130
+    except Exception as exc:
+        if land_requested:
+            if is_grpc_disconnect_error(exc):
+                log("LAND", f"connection closed after land command; exiting calmly: {exc}")
+                return 0
+            log("LAND", f"land command was already sent; not retrying safety land: {exc}")
+            return 1
+
+        log("FINISH", f"axis calibration failed before land command: {exc}")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as stop_exc:
+                log("CALIBRATE", f"offboard stop during error cleanup failed: {stop_exc}")
+        await try_safety_land(drone)
+        return 1
+    finally:
+        close_scan_monitor(rclpy, monitor)
+
+
 def candidate_near_position(candidate: OpeningCandidate, corridor_x: float, step_size: float) -> bool:
     return abs(candidate.corridor_x - corridor_x) <= max(0.25, step_size / 2.0)
 
@@ -1114,10 +1998,16 @@ def main() -> int:
         return run_scan_monitor(args)
     if args.takeoff_land_check:
         return asyncio.run(run_takeoff_land_check(args))
+    if args.corridor_follow_check:
+        return asyncio.run(run_corridor_follow_check(args))
+    if args.axis_calibration_check:
+        return asyncio.run(run_axis_calibration_check(args))
     if not args.dry_run:
         print(
             "Use --dry-run for pure Python simulation, --scan-monitor for ROS2 LaserScan monitoring, "
-            "or --takeoff-land-check for MAVSDK takeoff/land validation."
+            "--takeoff-land-check for MAVSDK takeoff/land validation, "
+            "--corridor-follow-check for low-speed front-safe corridor movement, "
+            "or --axis-calibration-check for offboard axis diagnosis."
         )
         return 2
     return run_dry_run(args)
