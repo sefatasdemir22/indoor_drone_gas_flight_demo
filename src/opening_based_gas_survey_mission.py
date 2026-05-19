@@ -231,6 +231,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--door-capture-crawl-step", type=float, default=0.15)
     parser.add_argument("--door-capture-max-crawl-steps", type=int, default=2)
     parser.add_argument("--door-capture-hold-seconds", type=float, default=0.8)
+    parser.add_argument("--enable-sensor-room-traversal", action="store_true")
+    parser.add_argument("--room-traverse-stop-distance", type=float, default=0.75)
+    parser.add_argument("--room-traverse-step-distance", type=float, default=0.25)
+    parser.add_argument("--room-traverse-max-distance", type=float, default=3.0)
+    parser.add_argument("--room-traverse-hold-seconds", type=float, default=0.8)
     parser.add_argument("--return-home", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -3003,6 +3008,7 @@ async def run_position_room_inspection_steps(
     log("POS", f"room_entry_distance={room_entry_distance:.2f} m")
     log("POS", f"max_inspections={max_inspections}")
     log("CAPTURE", f"no_backtrack_enabled={args.enable_no_backtrack_door_capture}")
+    log("ROOM", f"sensor_traversal_enabled={args.enable_sensor_room_traversal}")
 
     def reject_candidate(reason: str) -> None:
         nonlocal active_candidate
@@ -3214,6 +3220,86 @@ async def run_position_room_inspection_steps(
         log("CAPTURE", "rejected reason=insufficient_confirmation")
         return None
 
+    async def run_sensor_room_traversal(side: str, anchor_north: float, anchor_east: float) -> dict[str, Any]:
+        nonlocal current_north, current_east
+        stop_distance = max(0.0, args.room_traverse_stop_distance)
+        step_distance = max(0.0, args.room_traverse_step_distance)
+        max_distance = max(0.0, args.room_traverse_max_distance)
+        hold_seconds = max(0.0, args.room_traverse_hold_seconds)
+        direction = 1.0 if side == "left" else -1.0
+        direction_scan = "left_decision_scan" if side == "left" else "right_decision_scan"
+        traveled = 0.0
+        step_index = 0
+        stop_reason = "max_distance"
+        final_side_min = math.inf
+        final_side_avg = math.inf
+
+        log(
+            "ROOM",
+            f"traversal enabled side={side} scan={direction_scan} "
+            f"step={step_distance:.2f} max={max_distance:.2f} stop={stop_distance:.2f}",
+        )
+
+        while traveled < max_distance:
+            if front_motion_status(monitor, args) == "blocked":
+                stop_reason = "front_blocked"
+                log("ROOM", "stop reason=front_blocked")
+                break
+
+            next_step = min(step_distance, max_distance - traveled)
+            if next_step <= 0.0:
+                stop_reason = "max_distance"
+                break
+
+            target_north = anchor_north + direction * (traveled + next_step)
+            await goto_position_ned(
+                drone,
+                rclpy,
+                monitor,
+                position_type,
+                target_north,
+                anchor_east,
+                down_m,
+                yaw_deg,
+                hold_seconds,
+                f"room traverse {side} step {step_index + 1}",
+            )
+            current_north = target_north
+            current_east = anchor_east
+            traveled += next_step
+            step_index += 1
+
+            rclpy.spin_once(monitor.node, timeout_sec=0.05)
+            scan = monitor.decision_snapshot()
+            final_side_min = side_min_for_snapshot(scan, side)
+            final_side_avg = side_avg_for_snapshot(scan, side)
+            log(
+                "ROOM",
+                f"step={step_index} target_north={target_north:.2f} traveled={traveled:.2f} "
+                f"side_min={format_distance(final_side_min)} side_avg={format_distance(final_side_avg)}",
+            )
+            if final_side_min <= stop_distance:
+                stop_reason = "side_stop_distance"
+                log("ROOM", f"stop reason=side_stop_distance side_min={final_side_min:.2f}")
+                break
+
+        if traveled >= max_distance and stop_reason == "max_distance":
+            log("ROOM", f"stop reason=max_distance traveled={traveled:.2f}")
+
+        return {
+            "mode": "sensor_incremental",
+            "stop_distance_m": round(stop_distance, 3),
+            "step_distance_m": round(step_distance, 3),
+            "max_distance_m": round(max_distance, 3),
+            "actual_distance_m": round(traveled, 3),
+            "stop_reason": stop_reason,
+            "direction_scan": direction_scan,
+            "final_side_min_m": None if math.isinf(final_side_min) else round(final_side_min, 3),
+            "final_side_avg_m": None if math.isinf(final_side_avg) else round(final_side_avg, 3),
+            "depth_estimate_m": round(traveled, 3),
+            "width_estimate_m": None if math.isinf(final_side_avg) else round(final_side_avg, 3),
+        }
+
     async def inspect_position_opening(anchor: PositionOpeningAnchor) -> None:
         nonlocal current_north, current_east
         if len(events) >= max_inspections:
@@ -3268,22 +3354,39 @@ async def run_position_room_inspection_steps(
             rng,
         )
 
-        entry_north = anchor_north + room_entry_distance if side == "left" else anchor_north - room_entry_distance
-        log("POS", f"entering {side} room by position step: target_north={entry_north:.2f}, east={anchor_east:.2f}")
-        await goto_position_ned(
-            drone,
-            rclpy,
-            monitor,
-            position_type,
-            entry_north,
-            anchor_east,
-            down_m,
-            yaw_deg,
-            room_entry_hold_sec,
-            f"enter {side} opening",
-        )
-        current_north = entry_north
-        current_east = anchor_east
+        if args.enable_sensor_room_traversal:
+            traversal = await run_sensor_room_traversal(side, anchor_north, anchor_east)
+            entry_north = current_north
+        else:
+            entry_north = anchor_north + room_entry_distance if side == "left" else anchor_north - room_entry_distance
+            log("POS", f"entering {side} room by position step: target_north={entry_north:.2f}, east={anchor_east:.2f}")
+            await goto_position_ned(
+                drone,
+                rclpy,
+                monitor,
+                position_type,
+                entry_north,
+                anchor_east,
+                down_m,
+                yaw_deg,
+                room_entry_hold_sec,
+                f"enter {side} opening",
+            )
+            current_north = entry_north
+            current_east = anchor_east
+            traversal = {
+                "mode": "fixed_distance",
+                "stop_distance_m": None,
+                "step_distance_m": None,
+                "max_distance_m": round(room_entry_distance, 3),
+                "actual_distance_m": round(abs(entry_north - anchor_north), 3),
+                "stop_reason": "target_distance",
+                "direction_scan": "left_decision_scan" if side == "left" else "right_decision_scan",
+                "final_side_min_m": None,
+                "final_side_avg_m": None,
+                "depth_estimate_m": round(abs(entry_north - anchor_north), 3),
+                "width_estimate_m": None,
+            }
 
         inspection = await sample_gas_at_position(
             drone,
@@ -3338,6 +3441,17 @@ async def run_position_room_inspection_steps(
             "candidate_frames_seen": anchor.frames_seen,
             "enter_target_distance_m": round(room_entry_distance, 3),
             "enter_actual_distance_m": round(abs(entry_north - anchor_north), 3),
+            "room_traversal_mode": traversal["mode"],
+            "room_traverse_stop_distance_m": traversal["stop_distance_m"],
+            "room_traverse_step_distance_m": traversal["step_distance_m"],
+            "room_traverse_max_distance_m": traversal["max_distance_m"],
+            "room_traverse_actual_distance_m": traversal["actual_distance_m"],
+            "room_traverse_stop_reason": traversal["stop_reason"],
+            "room_direction_scan": traversal["direction_scan"],
+            "room_final_side_min_m": traversal["final_side_min_m"],
+            "room_final_side_avg_m": traversal["final_side_avg_m"],
+            "room_depth_estimate_m": traversal["depth_estimate_m"],
+            "room_width_estimate_m": traversal["width_estimate_m"],
             "exit_final_distance_m": None,
         }
         events.append(event)
