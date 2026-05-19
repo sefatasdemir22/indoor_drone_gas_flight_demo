@@ -236,6 +236,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--room-traverse-step-distance", type=float, default=0.25)
     parser.add_argument("--room-traverse-max-distance", type=float, default=3.0)
     parser.add_argument("--room-traverse-hold-seconds", type=float, default=0.8)
+    parser.add_argument("--enable-room-facing-yaw-entry", action="store_true")
+    parser.add_argument("--room-facing-step-distance", type=float, default=0.25)
+    parser.add_argument("--room-facing-max-distance", type=float, default=3.0)
+    parser.add_argument("--room-facing-front-stop-distance", type=float, default=0.75)
+    parser.add_argument("--room-facing-exit-step-distance", type=float, default=0.5)
+    parser.add_argument("--room-facing-step-hold-seconds", type=float, default=0.8)
+    parser.add_argument("--room-facing-yaw-settle-seconds", type=float, default=1.0)
+    parser.add_argument("--room-facing-door-forward-offset", type=float, default=0.0)
+    parser.add_argument("--room-facing-yaw-hold-before-seconds", type=float, default=0.5)
+    parser.add_argument("--room-facing-yaw-hold-after-seconds", type=float, default=1.0)
+    parser.add_argument("--room-facing-yaw-settle-repeat-count", type=int, default=5)
+    parser.add_argument("--room-facing-yaw-settle-repeat-interval", type=float, default=0.2)
+    parser.add_argument("--enable-room-facing-post-yaw-realign", action="store_true")
+    parser.add_argument("--room-facing-post-yaw-forward-offset-step", type=float, default=0.10)
+    parser.add_argument("--room-facing-post-yaw-max-forward-offset", type=float, default=0.30)
+    parser.add_argument("--room-facing-post-yaw-min-front-clearance", type=float, default=2.0)
     parser.add_argument("--return-home", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -806,6 +822,15 @@ def horizontal_distance(position: object | None, anchor_position: object | None)
         return None
     delta_north, delta_east, _delta_down = position_delta(position, anchor_position)
     return horizontal_magnitude(delta_north, delta_east)
+
+
+def normalize_yaw_deg(yaw_deg: float) -> float:
+    return float(yaw_deg) % 360.0
+
+
+def ned_forward_delta(yaw_deg: float, distance_m: float) -> tuple[float, float]:
+    yaw_rad = math.radians(yaw_deg)
+    return math.cos(yaw_rad) * distance_m, math.sin(yaw_rad) * distance_m
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -3009,6 +3034,7 @@ async def run_position_room_inspection_steps(
     log("POS", f"max_inspections={max_inspections}")
     log("CAPTURE", f"no_backtrack_enabled={args.enable_no_backtrack_door_capture}")
     log("ROOM", f"sensor_traversal_enabled={args.enable_sensor_room_traversal}")
+    log("ROOM", f"room_facing_yaw_enabled={args.enable_room_facing_yaw_entry}")
 
     def reject_candidate(reason: str) -> None:
         nonlocal active_candidate
@@ -3300,6 +3326,391 @@ async def run_position_room_inspection_steps(
             "width_estimate_m": None if math.isinf(final_side_avg) else round(final_side_avg, 3),
         }
 
+    def room_front_min_distance() -> float | None:
+        for msg in (monitor.latest_front, monitor.latest_front_decision):
+            stats = front_sector_stats(msg, args.front_sector_deg)
+            if stats.sample_count == 0:
+                continue
+            if stats.valid_count < max(1, args.min_valid_samples):
+                continue
+            if stats.valid_ratio < max(0.0, min(1.0, args.min_valid_ratio)):
+                continue
+            if stats.min_finite_distance is None:
+                return math.inf
+            return stats.min_finite_distance
+        return None
+
+    async def stabilize_room_facing_yaw(
+        north_m: float,
+        east_m: float,
+        from_yaw: float,
+        to_yaw: float,
+        label: str,
+    ) -> None:
+        hold_before = max(0.0, args.room_facing_yaw_hold_before_seconds)
+        hold_after = max(0.0, args.room_facing_yaw_hold_after_seconds)
+        repeat_count = max(1, args.room_facing_yaw_settle_repeat_count)
+        repeat_interval = max(0.0, args.room_facing_yaw_settle_repeat_interval)
+        from_yaw = normalize_yaw_deg(from_yaw)
+        to_yaw = normalize_yaw_deg(to_yaw)
+        log(
+            "ROOM",
+            f"yaw stabilize {label}: N={north_m:.2f}, E={east_m:.2f}, "
+            f"from={from_yaw:.1f}, to={to_yaw:.1f}, repeats={repeat_count}, interval={repeat_interval:.2f}s",
+        )
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            north_m,
+            east_m,
+            down_m,
+            from_yaw,
+            hold_before,
+            f"{label} yaw pre-hold",
+        )
+        for repeat_index in range(repeat_count):
+            log("ROOM", f"yaw stabilize {label} setpoint {repeat_index + 1}/{repeat_count}")
+            await drone.offboard.set_position_ned(position_type(north_m, east_m, down_m, to_yaw))
+            rclpy.spin_once(monitor.node, timeout_sec=0.02)
+            await asyncio.sleep(repeat_interval)
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            north_m,
+            east_m,
+            down_m,
+            to_yaw,
+            hold_after,
+            f"{label} yaw post-hold",
+        )
+
+    async def run_room_facing_yaw_entry(side: str, anchor_north: float, anchor_east: float) -> dict[str, Any]:
+        nonlocal current_north, current_east
+        step_distance = max(0.0, args.room_facing_step_distance)
+        max_distance = max(0.0, args.room_facing_max_distance)
+        stop_distance = max(0.0, args.room_facing_front_stop_distance)
+        hold_seconds = max(0.0, args.room_facing_step_hold_seconds)
+        door_forward_offset = max(0.0, args.room_facing_door_forward_offset)
+        corridor_yaw = normalize_yaw_deg(yaw_deg)
+        room_yaw = normalize_yaw_deg(corridor_yaw - 90.0 if side == "left" else corridor_yaw + 90.0)
+        corridor_forward_north, corridor_forward_east = ned_forward_delta(corridor_yaw, 1.0)
+        forward_north, forward_east = ned_forward_delta(room_yaw, 1.0)
+        entry_anchor_north = anchor_north
+        entry_anchor_east = anchor_east
+        traveled = 0.0
+        step_index = 0
+        stop_reason = "max_distance_safety_limit"
+        final_front_min: float | None = None
+        post_yaw_total_offset = 0.0
+        post_yaw_steps = 0
+        post_yaw_front_min: float | None = None
+
+        log(
+            "ROOM",
+            f"room-facing yaw entry side={side} room_yaw={room_yaw:.1f} "
+            f"step={step_distance:.2f} max={max_distance:.2f} front_stop={stop_distance:.2f} "
+            f"door_offset={door_forward_offset:.2f}",
+        )
+
+        if door_forward_offset > 0.0:
+            entry_anchor_north = anchor_north + corridor_forward_north * door_forward_offset
+            entry_anchor_east = anchor_east + corridor_forward_east * door_forward_offset
+            await goto_position_ned(
+                drone,
+                rclpy,
+                monitor,
+                position_type,
+                entry_anchor_north,
+                entry_anchor_east,
+                down_m,
+                corridor_yaw,
+                hold_seconds,
+                f"room-facing door forward offset {side}",
+            )
+            current_north = entry_anchor_north
+            current_east = entry_anchor_east
+
+        rclpy.spin_once(monitor.node, timeout_sec=0.05)
+        pre_scan = monitor.decision_snapshot()
+        pre_front_min = room_front_min_distance()
+        pre_front_clear, pre_front_distance = front_clearance_for_candidate(monitor, args)
+        pre_side_open, pre_side_reason, pre_side_metrics = side_decision_diagnostics(pre_scan, side, args)
+        pre_side_min = side_min_for_snapshot(pre_scan, side)
+        pre_side_avg = side_avg_for_snapshot(pre_scan, side)
+        pre_front_text = "unavailable" if pre_front_min is None else format_distance(pre_front_min)
+        pre_front_clear_text = "unknown" if pre_front_distance is None else format_distance(pre_front_distance)
+        log(
+            "ROOM",
+            f"pre-entry front_min={pre_front_text} corridor_clear={pre_front_clear} "
+            f"corridor_front={pre_front_clear_text}",
+        )
+        log(
+            "ROOM",
+            f"pre-entry {side}_min={format_distance(pre_side_min)} "
+            f"{side}_avg={format_distance(pre_side_avg)} open={pre_side_open} reason={pre_side_reason}",
+        )
+        log("ROOM", f"pre-entry metrics: {pre_side_metrics}")
+
+        if pre_front_min is None or not pre_front_clear or not pre_side_open:
+            stop_reason = "pre_entry_clearance_failed"
+            log("ROOM", f"room-facing entry aborted reason={stop_reason}")
+            return {
+                "mode": "room_facing_yaw",
+                "stop_distance_m": round(stop_distance, 3),
+                "step_distance_m": round(step_distance, 3),
+                "max_distance_m": round(max_distance, 3),
+                "actual_distance_m": 0.0,
+                "stop_reason": stop_reason,
+                "direction_scan": "front_scan",
+                "final_side_min_m": None,
+                "final_side_avg_m": None,
+                "depth_estimate_m": 0.0,
+                "width_estimate_m": None,
+                "room_facing_yaw_deg": round(room_yaw, 3),
+                "room_facing_final_front_min_m": (
+                    None if pre_front_min is None or math.isinf(pre_front_min) else round(pre_front_min, 3)
+                ),
+                "room_facing_exit_steps": None,
+                "room_facing_exit_actual_distance_m": None,
+                "room_facing_aborted": True,
+                "room_facing_door_forward_offset_m": round(door_forward_offset, 3),
+                "room_facing_entry_anchor_north": round(entry_anchor_north, 3),
+                "room_facing_entry_anchor_east": round(entry_anchor_east, 3),
+            }
+
+        await stabilize_room_facing_yaw(
+            entry_anchor_north,
+            entry_anchor_east,
+            corridor_yaw,
+            room_yaw,
+            f"turn toward {side} room",
+        )
+        current_north = entry_anchor_north
+        current_east = entry_anchor_east
+
+        if args.enable_room_facing_post_yaw_realign:
+            min_post_yaw_clearance = max(0.0, args.room_facing_post_yaw_min_front_clearance)
+            offset_step = max(0.0, args.room_facing_post_yaw_forward_offset_step)
+            max_offset = max(0.0, args.room_facing_post_yaw_max_forward_offset)
+            log(
+                "ROOM",
+                f"post-yaw realign enabled min_front={min_post_yaw_clearance:.2f} "
+                f"step={offset_step:.2f} max_offset={max_offset:.2f}",
+            )
+            while True:
+                rclpy.spin_once(monitor.node, timeout_sec=0.05)
+                post_yaw_front_min = room_front_min_distance()
+                front_text = "unavailable" if post_yaw_front_min is None else format_distance(post_yaw_front_min)
+                log("ROOM", f"post-yaw front_min={front_text} offset={post_yaw_total_offset:.2f}")
+                if post_yaw_front_min is not None and post_yaw_front_min >= min_post_yaw_clearance:
+                    log("ROOM", "post-yaw clearance accepted")
+                    break
+                if offset_step <= 0.0 or post_yaw_total_offset + offset_step > max_offset + 1e-9:
+                    stop_reason = "post_yaw_clearance_failed"
+                    log("ROOM", f"post-yaw clearance rejected reason={stop_reason}")
+                    return {
+                        "mode": "room_facing_yaw",
+                        "stop_distance_m": round(stop_distance, 3),
+                        "step_distance_m": round(step_distance, 3),
+                        "max_distance_m": round(max_distance, 3),
+                        "actual_distance_m": 0.0,
+                        "stop_reason": stop_reason,
+                        "direction_scan": "front_scan",
+                        "final_side_min_m": None,
+                        "final_side_avg_m": None,
+                        "depth_estimate_m": 0.0,
+                        "width_estimate_m": None,
+                        "room_facing_yaw_deg": round(room_yaw, 3),
+                        "room_facing_final_front_min_m": (
+                            None
+                            if post_yaw_front_min is None or math.isinf(post_yaw_front_min)
+                            else round(post_yaw_front_min, 3)
+                        ),
+                        "room_facing_exit_steps": None,
+                        "room_facing_exit_actual_distance_m": None,
+                        "room_facing_aborted": True,
+                        "room_facing_door_forward_offset_m": round(door_forward_offset, 3),
+                        "room_facing_entry_anchor_north": round(entry_anchor_north, 3),
+                        "room_facing_entry_anchor_east": round(entry_anchor_east, 3),
+                        "room_facing_post_yaw_realign_enabled": True,
+                        "room_facing_post_yaw_total_offset_m": round(post_yaw_total_offset, 3),
+                        "room_facing_post_yaw_front_min_m": (
+                            None
+                            if post_yaw_front_min is None or math.isinf(post_yaw_front_min)
+                            else round(post_yaw_front_min, 3)
+                        ),
+                        "room_facing_post_yaw_realign_steps": post_yaw_steps,
+                    }
+
+                post_yaw_total_offset += offset_step
+                post_yaw_steps += 1
+                entry_anchor_north += corridor_forward_north * offset_step
+                entry_anchor_east += corridor_forward_east * offset_step
+                log(
+                    "ROOM",
+                    f"post-yaw realign offset step={post_yaw_steps} total={post_yaw_total_offset:.2f} "
+                    f"target_N={entry_anchor_north:.2f} target_E={entry_anchor_east:.2f}",
+                )
+                await goto_position_ned(
+                    drone,
+                    rclpy,
+                    monitor,
+                    position_type,
+                    entry_anchor_north,
+                    entry_anchor_east,
+                    down_m,
+                    room_yaw,
+                    hold_seconds,
+                    f"post-yaw realign {side} step {post_yaw_steps}",
+                )
+                await stabilize_room_facing_yaw(
+                    entry_anchor_north,
+                    entry_anchor_east,
+                    room_yaw,
+                    room_yaw,
+                    f"post-yaw realign hold {side}",
+                )
+                current_north = entry_anchor_north
+                current_east = entry_anchor_east
+
+        while traveled < max_distance:
+            rclpy.spin_once(monitor.node, timeout_sec=0.05)
+            front_min = room_front_min_distance()
+            final_front_min = front_min
+            if front_min is not None and front_min <= stop_distance:
+                stop_reason = "front_stop_distance"
+                log("ROOM", f"stop before step reason=front_stop_distance front_min={front_min:.2f}")
+                break
+
+            safe_step_distance = min(step_distance, 0.25) if traveled < 1.0 else step_distance
+            next_step = min(safe_step_distance, max_distance - traveled)
+            if next_step <= 0.0:
+                break
+
+            target_north = entry_anchor_north + forward_north * (traveled + next_step)
+            target_east = entry_anchor_east + forward_east * (traveled + next_step)
+            await goto_position_ned(
+                drone,
+                rclpy,
+                monitor,
+                position_type,
+                target_north,
+                target_east,
+                down_m,
+                room_yaw,
+                hold_seconds,
+                f"room-facing enter {side} step {step_index + 1}",
+            )
+            current_north = target_north
+            current_east = target_east
+            traveled += next_step
+            step_index += 1
+
+            rclpy.spin_once(monitor.node, timeout_sec=0.05)
+            front_min = room_front_min_distance()
+            final_front_min = front_min
+            front_text = "unavailable" if front_min is None else format_distance(front_min)
+            log(
+                "ROOM",
+                f"room-facing step={step_index} traveled={traveled:.2f} "
+                f"front_min={front_text}",
+            )
+            if front_min is not None and front_min <= stop_distance:
+                stop_reason = "front_stop_distance"
+                log("ROOM", f"stop reason=front_stop_distance front_min={front_min:.2f}")
+                break
+
+        if traveled >= max_distance and stop_reason == "max_distance_safety_limit":
+            log("ROOM", f"stop reason=max_distance_safety_limit traveled={traveled:.2f}")
+
+        final_front = None if final_front_min is None or math.isinf(final_front_min) else round(final_front_min, 3)
+        return {
+            "mode": "room_facing_yaw",
+            "stop_distance_m": round(stop_distance, 3),
+            "step_distance_m": round(step_distance, 3),
+            "max_distance_m": round(max_distance, 3),
+            "actual_distance_m": round(traveled, 3),
+            "stop_reason": stop_reason,
+            "direction_scan": "front_scan",
+            "final_side_min_m": None,
+            "final_side_avg_m": None,
+            "depth_estimate_m": round(traveled, 3),
+            "width_estimate_m": None,
+            "room_facing_yaw_deg": round(room_yaw, 3),
+            "room_facing_final_front_min_m": final_front,
+            "room_facing_exit_steps": None,
+            "room_facing_exit_actual_distance_m": None,
+            "room_facing_aborted": False,
+            "room_facing_door_forward_offset_m": round(door_forward_offset, 3),
+            "room_facing_entry_anchor_north": round(entry_anchor_north, 3),
+            "room_facing_entry_anchor_east": round(entry_anchor_east, 3),
+            "room_facing_post_yaw_realign_enabled": bool(args.enable_room_facing_post_yaw_realign),
+            "room_facing_post_yaw_total_offset_m": round(post_yaw_total_offset, 3),
+            "room_facing_post_yaw_front_min_m": (
+                None
+                if post_yaw_front_min is None or math.isinf(post_yaw_front_min)
+                else round(post_yaw_front_min, 3)
+            ),
+            "room_facing_post_yaw_realign_steps": post_yaw_steps,
+        }
+
+    async def exit_room_facing_yaw(
+        side: str,
+        anchor_north: float,
+        anchor_east: float,
+        room_yaw: float,
+        traveled: float,
+    ) -> dict[str, Any]:
+        nonlocal current_north, current_east
+        exit_step_distance = max(0.01, args.room_facing_exit_step_distance)
+        hold_seconds = max(0.0, args.room_facing_step_hold_seconds)
+        corridor_yaw = normalize_yaw_deg(yaw_deg)
+        forward_north, forward_east = ned_forward_delta(room_yaw, 1.0)
+        exit_steps = 0
+        remaining = max(0.0, traveled)
+
+        log("ROOM", f"room-facing exit to anchor, distance={traveled:.2f}, step={exit_step_distance:.2f}")
+        while remaining > 1e-6:
+            safe_exit_step = min(exit_step_distance, 0.25) if remaining <= 1.0 else exit_step_distance
+            next_exit = min(safe_exit_step, remaining)
+            remaining -= next_exit
+            target_north = anchor_north + forward_north * remaining
+            target_east = anchor_east + forward_east * remaining
+            exit_steps += 1
+            await goto_position_ned(
+                drone,
+                rclpy,
+                monitor,
+                position_type,
+                target_north,
+                target_east,
+                down_m,
+                room_yaw,
+                hold_seconds,
+                f"room-facing exit {side} step {exit_steps}",
+            )
+            current_north = target_north
+            current_east = target_east
+
+        await stabilize_room_facing_yaw(
+            anchor_north,
+            anchor_east,
+            room_yaw,
+            corridor_yaw,
+            "turn back to corridor yaw",
+        )
+        current_north = anchor_north
+        current_east = anchor_east
+        return {
+            "exit_steps": exit_steps,
+            "exit_actual_distance_m": round(traveled, 3),
+            "exit_final_distance_m": 0.0,
+        }
+
     async def inspect_position_opening(anchor: PositionOpeningAnchor) -> None:
         nonlocal current_north, current_east
         if len(events) >= max_inspections:
@@ -3354,7 +3765,10 @@ async def run_position_room_inspection_steps(
             rng,
         )
 
-        if args.enable_sensor_room_traversal:
+        if args.enable_room_facing_yaw_entry:
+            traversal = await run_room_facing_yaw_entry(side, anchor_north, anchor_east)
+            entry_north = current_north
+        elif args.enable_sensor_room_traversal:
             traversal = await run_sensor_room_traversal(side, anchor_north, anchor_east)
             entry_north = current_north
         else:
@@ -3388,6 +3802,68 @@ async def run_position_room_inspection_steps(
                 "width_estimate_m": None,
             }
 
+        if traversal.get("room_facing_aborted"):
+            event = {
+                "inspection_index": len(events) + 1,
+                "side": side,
+                "opening_id": opening_id,
+                "step_index": anchor.mature_step + 1,
+                "candidate_start_step": anchor.start_step + 1,
+                "candidate_mature_step": anchor.mature_step + 1,
+                "baseline_avg_ppm": round(baseline.avg_ppm, 3),
+                "inspection_avg_ppm": None,
+                "delta_ppm": None,
+                "gas_candidate": False,
+                "candidate_reason": traversal["stop_reason"],
+                "baseline_sample_count": baseline.sample_count,
+                "inspection_sample_count": 0,
+                "baseline_position": baseline.position,
+                "inspection_position": None,
+                "entry_anchor_position": {"north": round(anchor_north, 3), "east": round(anchor_east, 3), "altitude": -down_m},
+                "entry_anchor_source": anchor.anchor_source,
+                "candidate_start_position": position_as_event_dict(anchor.start_position),
+                "candidate_mature_position": position_as_event_dict(anchor.mature_position),
+                "candidate_best_position": position_as_event_dict(anchor.best_position),
+                "candidate_best_side_avg": round(anchor.best_side_avg, 3),
+                "candidate_frames_seen": anchor.frames_seen,
+                "enter_target_distance_m": round(room_entry_distance, 3),
+                "enter_actual_distance_m": 0.0,
+                "room_traversal_mode": traversal["mode"],
+                "room_traverse_stop_distance_m": traversal["stop_distance_m"],
+                "room_traverse_step_distance_m": traversal["step_distance_m"],
+                "room_traverse_max_distance_m": traversal["max_distance_m"],
+                "room_traverse_actual_distance_m": traversal["actual_distance_m"],
+                "room_traverse_stop_reason": traversal["stop_reason"],
+                "room_direction_scan": traversal["direction_scan"],
+                "room_final_side_min_m": traversal["final_side_min_m"],
+                "room_final_side_avg_m": traversal["final_side_avg_m"],
+                "room_depth_estimate_m": traversal["depth_estimate_m"],
+                "room_width_estimate_m": traversal["width_estimate_m"],
+                "room_facing_yaw_deg": traversal.get("room_facing_yaw_deg"),
+                "room_facing_final_front_min_m": traversal.get("room_facing_final_front_min_m"),
+                "room_facing_exit_steps": traversal.get("room_facing_exit_steps"),
+                "room_facing_exit_actual_distance_m": traversal.get("room_facing_exit_actual_distance_m"),
+                "room_facing_door_forward_offset_m": traversal.get("room_facing_door_forward_offset_m"),
+                "room_facing_yaw_hold_before_seconds": round(max(0.0, args.room_facing_yaw_hold_before_seconds), 3),
+                "room_facing_yaw_hold_after_seconds": round(max(0.0, args.room_facing_yaw_hold_after_seconds), 3),
+                "room_facing_yaw_settle_repeat_count": max(1, args.room_facing_yaw_settle_repeat_count),
+                "room_facing_post_yaw_realign_enabled": traversal.get("room_facing_post_yaw_realign_enabled"),
+                "room_facing_post_yaw_total_offset_m": traversal.get("room_facing_post_yaw_total_offset_m"),
+                "room_facing_post_yaw_front_min_m": traversal.get("room_facing_post_yaw_front_min_m"),
+                "room_facing_post_yaw_realign_steps": traversal.get("room_facing_post_yaw_realign_steps"),
+                "room_facing_entry_anchor_position": {
+                    "north": traversal.get("room_facing_entry_anchor_north"),
+                    "east": traversal.get("room_facing_entry_anchor_east"),
+                    "altitude": -down_m,
+                },
+                "exit_final_distance_m": None,
+            }
+            events.append(event)
+            write_inspection_events(args.inspection_events_output, payload)
+            log("ROOM", "room-facing inspection aborted before entry; continuing corridor flow")
+            return
+
+        inspection_yaw = float(traversal.get("room_facing_yaw_deg", yaw_deg) or yaw_deg)
         inspection = await sample_gas_at_position(
             drone,
             rclpy,
@@ -3399,7 +3875,7 @@ async def run_position_room_inspection_steps(
             current_north,
             current_east,
             down_m,
-            yaw_deg,
+            inspection_yaw,
             compute_ppm,
             active_sources,
             rng,
@@ -3440,7 +3916,11 @@ async def run_position_room_inspection_steps(
             "candidate_best_side_avg": round(anchor.best_side_avg, 3),
             "candidate_frames_seen": anchor.frames_seen,
             "enter_target_distance_m": round(room_entry_distance, 3),
-            "enter_actual_distance_m": round(abs(entry_north - anchor_north), 3),
+            "enter_actual_distance_m": (
+                traversal["actual_distance_m"]
+                if traversal["mode"] == "room_facing_yaw"
+                else round(abs(entry_north - anchor_north), 3)
+            ),
             "room_traversal_mode": traversal["mode"],
             "room_traverse_stop_distance_m": traversal["stop_distance_m"],
             "room_traverse_step_distance_m": traversal["step_distance_m"],
@@ -3452,27 +3932,60 @@ async def run_position_room_inspection_steps(
             "room_final_side_avg_m": traversal["final_side_avg_m"],
             "room_depth_estimate_m": traversal["depth_estimate_m"],
             "room_width_estimate_m": traversal["width_estimate_m"],
+            "room_facing_yaw_deg": traversal.get("room_facing_yaw_deg"),
+            "room_facing_final_front_min_m": traversal.get("room_facing_final_front_min_m"),
+            "room_facing_exit_steps": traversal.get("room_facing_exit_steps"),
+            "room_facing_exit_actual_distance_m": traversal.get("room_facing_exit_actual_distance_m"),
+            "room_facing_door_forward_offset_m": traversal.get("room_facing_door_forward_offset_m"),
+            "room_facing_yaw_hold_before_seconds": round(max(0.0, args.room_facing_yaw_hold_before_seconds), 3),
+            "room_facing_yaw_hold_after_seconds": round(max(0.0, args.room_facing_yaw_hold_after_seconds), 3),
+            "room_facing_yaw_settle_repeat_count": max(1, args.room_facing_yaw_settle_repeat_count),
+            "room_facing_post_yaw_realign_enabled": traversal.get("room_facing_post_yaw_realign_enabled"),
+            "room_facing_post_yaw_total_offset_m": traversal.get("room_facing_post_yaw_total_offset_m"),
+            "room_facing_post_yaw_front_min_m": traversal.get("room_facing_post_yaw_front_min_m"),
+            "room_facing_post_yaw_realign_steps": traversal.get("room_facing_post_yaw_realign_steps"),
+            "room_facing_entry_anchor_position": (
+                {
+                    "north": traversal.get("room_facing_entry_anchor_north"),
+                    "east": traversal.get("room_facing_entry_anchor_east"),
+                    "altitude": -down_m,
+                }
+                if traversal.get("room_facing_entry_anchor_north") is not None
+                else None
+            ),
             "exit_final_distance_m": None,
         }
         events.append(event)
         write_inspection_events(args.inspection_events_output, payload)
 
-        log("POS", f"exiting {side} room back to corridor anchor")
-        await goto_position_ned(
-            drone,
-            rclpy,
-            monitor,
-            position_type,
-            anchor_north,
-            anchor_east,
-            down_m,
-            yaw_deg,
-            max(2.0, room_entry_hold_sec),
-            f"exit {side} opening",
-        )
-        current_north = anchor_north
-        current_east = anchor_east
-        event["exit_final_distance_m"] = 0.0
+        if traversal["mode"] == "room_facing_yaw":
+            exit_summary = await exit_room_facing_yaw(
+                side,
+                float(traversal.get("room_facing_entry_anchor_north", anchor_north)),
+                float(traversal.get("room_facing_entry_anchor_east", anchor_east)),
+                float(traversal["room_facing_yaw_deg"]),
+                float(traversal["actual_distance_m"]),
+            )
+            event["room_facing_exit_steps"] = exit_summary["exit_steps"]
+            event["room_facing_exit_actual_distance_m"] = exit_summary["exit_actual_distance_m"]
+            event["exit_final_distance_m"] = exit_summary["exit_final_distance_m"]
+        else:
+            log("POS", f"exiting {side} room back to corridor anchor")
+            await goto_position_ned(
+                drone,
+                rclpy,
+                monitor,
+                position_type,
+                anchor_north,
+                anchor_east,
+                down_m,
+                yaw_deg,
+                max(2.0, room_entry_hold_sec),
+                f"exit {side} opening",
+            )
+            current_north = anchor_north
+            current_east = anchor_east
+            event["exit_final_distance_m"] = 0.0
         write_inspection_events(args.inspection_events_output, payload)
 
     await goto_position_ned(drone, rclpy, monitor, position_type, current_north, current_east, down_m, yaw_deg, 5.0, "initial hover")
