@@ -248,6 +248,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--room-facing-yaw-hold-after-seconds", type=float, default=1.0)
     parser.add_argument("--room-facing-yaw-settle-repeat-count", type=int, default=5)
     parser.add_argument("--room-facing-yaw-settle-repeat-interval", type=float, default=0.2)
+    parser.add_argument("--room-facing-yaw-interpolation-step-deg", type=float, default=15.0)
+    parser.add_argument("--room-facing-yaw-interpolation-hold-seconds", type=float, default=0.2)
     parser.add_argument("--enable-room-facing-post-yaw-realign", action="store_true")
     parser.add_argument("--room-facing-post-yaw-forward-offset-step", type=float, default=0.10)
     parser.add_argument("--room-facing-post-yaw-max-forward-offset", type=float, default=0.30)
@@ -826,6 +828,25 @@ def horizontal_distance(position: object | None, anchor_position: object | None)
 
 def normalize_yaw_deg(yaw_deg: float) -> float:
     return float(yaw_deg) % 360.0
+
+
+def shortest_yaw_delta_deg(from_yaw: float, to_yaw: float) -> float:
+    return (normalize_yaw_deg(to_yaw) - normalize_yaw_deg(from_yaw) + 540.0) % 360.0 - 180.0
+
+
+def interpolated_yaw_targets(from_yaw: float, to_yaw: float, step_deg: float) -> list[float]:
+    from_yaw = normalize_yaw_deg(from_yaw)
+    to_yaw = normalize_yaw_deg(to_yaw)
+    delta = shortest_yaw_delta_deg(from_yaw, to_yaw)
+    step_deg = max(0.0, step_deg)
+    if step_deg <= 0.0 or abs(delta) <= step_deg:
+        return [to_yaw]
+
+    step_count = int(math.ceil(abs(delta) / step_deg))
+    return [
+        normalize_yaw_deg(from_yaw + delta * float(index) / float(step_count))
+        for index in range(1, step_count + 1)
+    ]
 
 
 def ned_forward_delta(yaw_deg: float, distance_m: float) -> tuple[float, float]:
@@ -3351,12 +3372,17 @@ async def run_position_room_inspection_steps(
         hold_after = max(0.0, args.room_facing_yaw_hold_after_seconds)
         repeat_count = max(1, args.room_facing_yaw_settle_repeat_count)
         repeat_interval = max(0.0, args.room_facing_yaw_settle_repeat_interval)
+        interpolation_step = max(0.0, args.room_facing_yaw_interpolation_step_deg)
+        interpolation_hold = max(0.0, args.room_facing_yaw_interpolation_hold_seconds)
         from_yaw = normalize_yaw_deg(from_yaw)
         to_yaw = normalize_yaw_deg(to_yaw)
+        yaw_targets = interpolated_yaw_targets(from_yaw, to_yaw, interpolation_step)
         log(
             "ROOM",
             f"yaw stabilize {label}: N={north_m:.2f}, E={east_m:.2f}, "
-            f"from={from_yaw:.1f}, to={to_yaw:.1f}, repeats={repeat_count}, interval={repeat_interval:.2f}s",
+            f"from={from_yaw:.1f}, to={to_yaw:.1f}, "
+            f"interp_step={interpolation_step:.1f}, targets={len(yaw_targets)}, "
+            f"repeats={repeat_count}, interval={repeat_interval:.2f}s",
         )
         await goto_position_ned(
             drone,
@@ -3370,6 +3396,15 @@ async def run_position_room_inspection_steps(
             hold_before,
             f"{label} yaw pre-hold",
         )
+        for target_index, yaw_target in enumerate(yaw_targets):
+            log(
+                "ROOM",
+                f"yaw interpolate {label} target {target_index + 1}/{len(yaw_targets)} "
+                f"yaw={yaw_target:.1f}",
+            )
+            await drone.offboard.set_position_ned(position_type(north_m, east_m, down_m, yaw_target))
+            rclpy.spin_once(monitor.node, timeout_sec=0.02)
+            await asyncio.sleep(interpolation_hold)
         for repeat_index in range(repeat_count):
             log("ROOM", f"yaw stabilize {label} setpoint {repeat_index + 1}/{repeat_count}")
             await drone.offboard.set_position_ned(position_type(north_m, east_m, down_m, to_yaw))
@@ -3847,6 +3882,11 @@ async def run_position_room_inspection_steps(
                 "room_facing_yaw_hold_before_seconds": round(max(0.0, args.room_facing_yaw_hold_before_seconds), 3),
                 "room_facing_yaw_hold_after_seconds": round(max(0.0, args.room_facing_yaw_hold_after_seconds), 3),
                 "room_facing_yaw_settle_repeat_count": max(1, args.room_facing_yaw_settle_repeat_count),
+                "room_facing_yaw_interpolation_step_deg": round(max(0.0, args.room_facing_yaw_interpolation_step_deg), 3),
+                "room_facing_yaw_interpolation_hold_seconds": round(
+                    max(0.0, args.room_facing_yaw_interpolation_hold_seconds),
+                    3,
+                ),
                 "room_facing_post_yaw_realign_enabled": traversal.get("room_facing_post_yaw_realign_enabled"),
                 "room_facing_post_yaw_total_offset_m": traversal.get("room_facing_post_yaw_total_offset_m"),
                 "room_facing_post_yaw_front_min_m": traversal.get("room_facing_post_yaw_front_min_m"),
@@ -3940,6 +3980,11 @@ async def run_position_room_inspection_steps(
             "room_facing_yaw_hold_before_seconds": round(max(0.0, args.room_facing_yaw_hold_before_seconds), 3),
             "room_facing_yaw_hold_after_seconds": round(max(0.0, args.room_facing_yaw_hold_after_seconds), 3),
             "room_facing_yaw_settle_repeat_count": max(1, args.room_facing_yaw_settle_repeat_count),
+            "room_facing_yaw_interpolation_step_deg": round(max(0.0, args.room_facing_yaw_interpolation_step_deg), 3),
+            "room_facing_yaw_interpolation_hold_seconds": round(
+                max(0.0, args.room_facing_yaw_interpolation_hold_seconds),
+                3,
+            ),
             "room_facing_post_yaw_realign_enabled": traversal.get("room_facing_post_yaw_realign_enabled"),
             "room_facing_post_yaw_total_offset_m": traversal.get("room_facing_post_yaw_total_offset_m"),
             "room_facing_post_yaw_front_min_m": traversal.get("room_facing_post_yaw_front_min_m"),
