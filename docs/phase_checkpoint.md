@@ -1,87 +1,105 @@
 # Opening-Based Gas Survey Mission Checkpoint
 
-This document summarizes the current checkpoint for the opening-based indoor
-drone survey prototype. It is a development checkpoint, not a final autonomous
-survey claim.
+This document summarizes the current working checkpoint for the opening-based
+indoor drone gas survey prototype. It is a development checkpoint, not a final
+full-autonomy claim.
 
-## Current Working Capabilities
+## Current Checkpoint
 
-- The project starts the PX4/Gazebo indoor corridor-room world with `./baslat.sh`.
-- The drone can connect through MAVSDK, take off, run a low-speed body-frame
-  corridor-follow check, stop offboard mode, and land.
-- The mission script reads these ROS2 LaserScan topics:
-  - `/drone/front_scan`
-  - `/drone/left_scan`
-  - `/drone/right_scan`
-- Front safety is active during corridor-follow. It is useful for front-facing
-  wall-like obstacles, but it is not a guaranteed blocker for low floor
-  obstacles.
-- Passive opening decisions are logged during corridor-follow:
-  - normal corridor: `FOLLOW_FORWARD`
-  - visible left opening: `DETECT_LEFT_OPENING`
-  - visible right opening: `DETECT_RIGHT_OPENING`
-- `--enable-opening-probe` enables one short optional lateral body-frame probe
-  after the first detected opening.
-- The opening probe is intentionally small and conservative. It does not perform
-  full room exploration.
-- Gas mapping is not integrated into this mission script yet. Live gas mapping
-  still runs as a separate ROS2 process with `src/live_gas_mapping_ros2.py`.
+- Git checkpoint: `133f89f Add room-facing yaw interpolation`
+- Main mission script: `src/opening_based_gas_survey_mission.py`
+- Main output: `results/opening_inspection_events.json`
 
-## Demo Commands
+## Working Capabilities
 
-Start the simulator in the first terminal:
+- Starts PX4/Gazebo indoor corridor-room world with `./baslat.sh`.
+- Connects through MAVSDK and runs position-mode corridor steps.
+- Reads wide and decision LaserScan topics for opening and safety logic.
+- Detects candidate openings from side decision scans.
+- Uses no-backtrack door capture to avoid passing the door before inspection.
+- Applies a small door forward offset before room-facing entry.
+- Turns toward the room with yaw interpolation and repeated yaw setpoints.
+- Performs post-yaw realignment if front clearance is low.
+- Enters the room in room-facing mode, using front scan as the room-direction sensor.
+- Stops room traversal when front distance reaches the configured stop distance.
+- Samples gas baseline and inspection ppm.
+- Exits the room incrementally.
+- Returns to corridor yaw and continues corridor progression.
+- Honors `--max-inspections`; later opening candidates can still be detected without being inspected.
+
+## Validated Behavior
+
+Recent validation accepted as successful:
+
+- no-backtrack capture worked
+- door forward offset worked
+- post-yaw realignment worked
+- room-facing yaw entry worked
+- yaw interpolation made the turn smoother
+- drone entered the room by roughly 5 m
+- front-distance stop triggered
+- gas measurement was written to event JSON
+- incremental exit worked
+- corridor continuation after inspection stayed stable
+- revisit loop was not observed
+
+Representative event fields from the successful checkpoint:
+
+- `room_traversal_mode="room_facing_yaw"`
+- `room_traverse_stop_reason="front_stop_distance"`
+- `room_traverse_actual_distance_m=5.0`
+- `room_facing_final_front_min_m≈1.23`
+- `inspection_avg_ppm≈8.29`
+- `delta_ppm≈3.30`
+- `room_facing_yaw_interpolation_step_deg=15.0`
+- `room_facing_yaw_interpolation_hold_seconds=0.2`
+- `room_facing_exit_steps=12`
+
+## Main Demo Command
+
+Start the simulator:
 
 ```bash
 cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
 ./baslat.sh
 ```
 
-Run corridor-follow without opening probe:
+Run the current room-facing validation mission:
 
 ```bash
 python3 src/opening_based_gas_survey_mission.py \
-  --corridor-follow-check \
-  --corridor-step-count 8 \
-  --body-forward-speed 0.20 \
-  --corridor-step-duration-seconds 3.0 \
-  --pause-between-steps 1.0 \
-  --offboard-warmup-seconds 1.5 \
-  --min-takeoff-confirm-altitude 0.65
+  --position-room-inspection-check \
+  --enable-no-backtrack-door-capture \
+  --enable-room-facing-yaw-entry \
+  --enable-room-facing-post-yaw-realign \
+  --position-step-count 30 \
+  --position-forward-step 0.4 \
+  --position-hold-seconds 2.5 \
+  --position-altitude 1.2 \
+  --position-yaw 90.0 \
+  --room-facing-step-distance 0.25 \
+  --room-facing-max-distance 8.0 \
+  --room-facing-front-stop-distance 1.5 \
+  --room-facing-exit-step-distance 0.5 \
+  --room-facing-step-hold-seconds 0.8 \
+  --room-facing-door-forward-offset 0.25 \
+  --room-facing-yaw-hold-before-seconds 0.5 \
+  --room-facing-yaw-hold-after-seconds 1.0 \
+  --room-facing-yaw-settle-repeat-count 5 \
+  --room-facing-yaw-settle-repeat-interval 0.2 \
+  --room-facing-yaw-interpolation-step-deg 15 \
+  --room-facing-yaw-interpolation-hold-seconds 0.2 \
+  --room-facing-post-yaw-min-front-clearance 2.0 \
+  --room-facing-post-yaw-forward-offset-step 0.10 \
+  --room-facing-post-yaw-max-forward-offset 0.30 \
+  --door-capture-confirm-frames 3 \
+  --door-capture-crawl-step 0.15 \
+  --door-capture-max-crawl-steps 2 \
+  --door-capture-hold-seconds 0.8 \
+  --max-inspections 1 \
+  --gas-scenario possible_gas_zone_4 \
+  --gas-seed 1
 ```
-
-Run corridor-follow with the optional opening probe:
-
-```bash
-python3 src/opening_based_gas_survey_mission.py \
-  --corridor-follow-check \
-  --enable-opening-probe \
-  --corridor-step-count 8 \
-  --body-forward-speed 0.20 \
-  --corridor-step-duration-seconds 3.0 \
-  --pause-between-steps 1.0 \
-  --offboard-warmup-seconds 1.5 \
-  --min-takeoff-confirm-altitude 0.65 \
-  --probe-side-speed 0.12 \
-  --probe-duration-seconds 1.5
-```
-
-Optional live gas mapping can be run in a separate terminal. This script does
-not command the drone:
-
-```bash
-python3 src/live_gas_mapping_ros2.py \
-  --scenario possible_gas_zone_4 \
-  --duration-seconds 30 \
-  --sample-rate-hz 5 \
-  --seed 1 \
-  --hide-source-marker \
-  --route-min-altitude 0.5
-```
-
-The demo command uses `possible_gas_zone_4` as a deterministic gas scenario for
-a more repeatable presentation heatmap. It hides the ground-truth gas source
-marker and filters low-altitude takeoff samples from the route/scatter drawing
-only. CSV and JSON records remain unchanged.
 
 ## Dry-Run Checks
 
@@ -89,89 +107,31 @@ These checks do not start PX4/Gazebo and do not command the drone:
 
 ```bash
 python3 -m py_compile src/opening_based_gas_survey_mission.py
-python3 src/opening_based_gas_survey_mission.py --dry-run --seed 1
+python3 -m py_compile src/opening_mission_types.py
+python3 -m py_compile src/opening_scan_decision.py
 python3 src/opening_based_gas_survey_mission.py --dry-run --dry-run-scenario normal_corridor_side_distance
-python3 src/opening_based_gas_survey_mission.py --dry-run --dry-run-scenario left_opening
-python3 src/opening_based_gas_survey_mission.py --dry-run --dry-run-scenario right_opening
 python3 src/opening_based_gas_survey_mission.py --dry-run --dry-run-scenario front_blocked_left_open
 ```
 
 Expected dry-run behavior:
 
 - `normal_corridor_side_distance` should produce `FOLLOW_FORWARD`.
-- `left_opening` should produce `DETECT_LEFT_OPENING`.
-- `right_opening` should produce `DETECT_RIGHT_OPENING`.
-- `front_blocked_left_open` should produce `BYPASS_LEFT` in the decision log.
+- `front_blocked_left_open` should produce `BYPASS_LEFT`.
 
 ## Known Limitations
 
-- This is not a full autonomous survey mission yet.
-- There is no SLAM, frontier exploration, global path planning, or map-based
-  navigation.
-- Opening detection is based on the current front/left/right LaserScan readings
-  and simple thresholds.
-- The opening probe is short, optional, and visually small. It only verifies
-  that a detected opening can trigger a small lateral motion response.
-- The mission does not return to the corridor after probing. The current V1
-  ends the corridor-follow check and lands after the probe.
-- Landing bounce has been observed in some runs.
-- Scan readiness can occasionally time out on the first run if ROS2 scan topics
-  are not ready yet. Re-running the same command has worked in later tests.
-- Red low obstacles in the current world can be flown over at the current drone
-  altitude. Front safety should not be described as a guaranteed blocker for
-  those low floor obstacles.
-- Gas mapping is still separate from this mission script. The mission does not
-  directly trigger gas samples or heatmap generation.
-- Debug heatmaps may show the ground-truth gas source marker. Demo heatmaps can
-  hide this marker so the plot does not imply that the drone already knows the
-  source location.
-- `--route-min-altitude` is only a visualization filter for the route/scatter
-  drawing. It does not remove samples from the raw CSV or scenario JSON.
-- `--scenario random`, `--scenario no_gas`, and `--scenario clean_air` are valid
-  robustness tests, but they can produce weak or no visible gas plume in a
-  presentation heatmap.
-
-## Recommended Demo Flow
-
-1. Start the simulator with `./baslat.sh`.
-2. Confirm relevant topics are visible:
-
-   ```bash
-   ros2 topic list | grep -Ei "front_scan|left_scan|right_scan|vehicle_local_position"
-   ```
-
-3. Run the dry-run checks if code changes were made.
-4. Run corridor-follow without probe to show stable movement and passive opening
-   decisions.
-5. Run corridor-follow with `--enable-opening-probe` to show that an opening
-   decision can trigger a short lateral probe.
-6. Run `live_gas_mapping_ros2.py` in another terminal before the mission when a
-   gas mapping demo is needed:
-
-   ```bash
-   python3 src/live_gas_mapping_ros2.py \
-     --scenario possible_gas_zone_4 \
-     --duration-seconds 30 \
-     --sample-rate-hz 5 \
-     --seed 1 \
-     --hide-source-marker \
-     --route-min-altitude 0.5
-   ```
-
-   Expected outputs:
-
-   - `results/live_ros2_gas_samples.csv`
-   - `results/live_ros2_scenario_info.json`
-   - `results/live_ros2_gas_heatmap.png`
+- No SLAM, frontier exploration, global planner, or map integration yet.
+- Return-home is not implemented in the main room-facing mission flow yet.
+- Multi-room inspection has not been checkpointed yet.
+- Landing bounce can happen in some runs.
+- Gas candidate boolean threshold is conservative; event deltas can be visible while `gas_candidate=false`.
+- The older velocity/crab traversal paths are retained for diagnostics and history, but they are not the current recommended demo path.
 
 ## Next Phases
 
-- Improve takeoff and landing consistency, especially landing bounce.
-- Make the opening probe more visible while keeping it safe.
-- Add a short hover/sample window after a successful probe.
-- Add optional return-to-corridor behavior after probing.
-- Connect mission events with the live gas mapping workflow.
-- Build a limited survey flow: corridor-follow, detect opening, probe/sample,
-  continue or land.
-- Keep heavy SLAM, global path planning, and full unknown-environment
-  exploration out of scope until the simple demo is stable.
+- EventBuilder and GasDecision cleanup.
+- Multi-room V1 with multiple event records.
+- Multi-level gas classification: `weak`, `moderate`, `strong`.
+- Return-home V1 using local NED start position.
+- Landing stability phase.
+
