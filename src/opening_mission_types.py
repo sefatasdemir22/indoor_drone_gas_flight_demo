@@ -120,6 +120,7 @@ class PositionOpeningAnchor:
     mature_step: int
     anchor_north: float
     anchor_east: float
+    anchor_source: str
     start_position: object | None
     mature_position: object | None
     best_position: object | None

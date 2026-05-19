@@ -226,6 +226,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--position-yaw", type=float, default=90.0)
     parser.add_argument("--position-room-entry-distance", type=float, default=1.5)
     parser.add_argument("--position-room-entry-hold-seconds", type=float, default=2.5)
+    parser.add_argument("--enable-no-backtrack-door-capture", action="store_true")
+    parser.add_argument("--door-capture-confirm-frames", type=int, default=3)
+    parser.add_argument("--door-capture-crawl-step", type=float, default=0.15)
+    parser.add_argument("--door-capture-max-crawl-steps", type=int, default=2)
+    parser.add_argument("--door-capture-hold-seconds", type=float, default=0.8)
     parser.add_argument("--return-home", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -2997,6 +3002,7 @@ async def run_position_room_inspection_steps(
     log("POS", f"yaw={yaw_deg:.1f} deg")
     log("POS", f"room_entry_distance={room_entry_distance:.2f} m")
     log("POS", f"max_inspections={max_inspections}")
+    log("CAPTURE", f"no_backtrack_enabled={args.enable_no_backtrack_door_capture}")
 
     def reject_candidate(reason: str) -> None:
         nonlocal active_candidate
@@ -3008,6 +3014,17 @@ async def run_position_room_inspection_steps(
             f"frames={active_candidate.frames_seen} best={active_candidate.best_side_avg:.2f}",
         )
         active_candidate = None
+
+    def capture_candidate_side(scan: ScanSnapshot) -> str | None:
+        left_open, _left_reason, _left_metrics = side_decision_diagnostics(scan, "left", args)
+        right_open, _right_reason, _right_metrics = side_decision_diagnostics(scan, "right", args)
+        if left_open and right_open:
+            return "left" if scan.left_avg >= scan.right_avg else "right"
+        if left_open:
+            return "left"
+        if right_open:
+            return "right"
+        return None
 
     async def update_candidate(step_index: int, phase: str) -> PositionOpeningAnchor | None:
         nonlocal active_candidate
@@ -3094,6 +3111,7 @@ async def run_position_room_inspection_steps(
             mature_step=step_index,
             anchor_north=current_north,
             anchor_east=anchor_east,
+            anchor_source="candidate_start",
             start_position=candidate.start_position,
             mature_position=current_position,
             best_position=candidate.best_position,
@@ -3109,6 +3127,93 @@ async def run_position_room_inspection_steps(
         active_candidate = None
         return anchor
 
+    async def try_no_backtrack_capture(step_index: int, side: str) -> PositionOpeningAnchor | None:
+        nonlocal current_east
+        confirm_target = max(1, args.door_capture_confirm_frames)
+        hold_sec_capture = max(0.0, args.door_capture_hold_seconds)
+        crawl_step = max(0.0, args.door_capture_crawl_step)
+        max_crawl_steps = max(0, args.door_capture_max_crawl_steps)
+        confirmed_frames = 0
+        best_position: object | None = None
+        best_side_avg = -math.inf
+        started_position = await read_position_ned_quiet(drone)
+
+        log(
+            "CAPTURE",
+            f"started side={side} step={step_index + 1} "
+            f"confirm_frames={confirm_target} crawl_step={crawl_step:.2f} max_crawl_steps={max_crawl_steps}",
+        )
+
+        for crawl_index in range(max_crawl_steps + 1):
+            await goto_position_ned(
+                drone,
+                rclpy,
+                monitor,
+                position_type,
+                current_north,
+                current_east,
+                down_m,
+                yaw_deg,
+                hold_sec_capture,
+                f"capture hold {side} {crawl_index + 1}/{max_crawl_steps + 1}",
+            )
+            rclpy.spin_once(monitor.node, timeout_sec=0.05)
+            scan = monitor.decision_snapshot()
+            is_open, reason, metrics = side_decision_diagnostics(scan, side, args)
+            front_clear, front_distance = front_clearance_for_candidate(monitor, args)
+            side_avg = side_avg_for_snapshot(scan, side)
+            side_min = side_min_for_snapshot(scan, side)
+            current_position = await read_position_ned_quiet(drone)
+            if side_avg > best_side_avg:
+                best_side_avg = side_avg
+                best_position = current_position
+            front_text = "unknown" if front_distance is None else f"{front_distance:.2f}"
+            log(
+                "CAPTURE",
+                f"confirm frame={confirmed_frames + 1}/{confirm_target} side={side} "
+                f"open={is_open} reason={reason} side_avg={side_avg:.2f} side_min={side_min:.2f} front={front_text}",
+            )
+            log("CAPTURE", metrics)
+
+            if args.opening_require_front_clear and not front_clear:
+                log("CAPTURE", "rejected reason=front_not_clear")
+                return None
+            if is_open:
+                confirmed_frames += 1
+                if confirmed_frames >= confirm_target:
+                    anchor_position = current_position
+                    anchor_east = current_east
+                    if anchor_position is not None:
+                        anchor_east = float(anchor_position.east_m)
+                    log(
+                        "CAPTURE",
+                        f"confirmed no-backtrack anchor side={side} "
+                        f"N={current_north:.2f}, E={anchor_east:.2f}, frames={confirmed_frames}",
+                    )
+                    return PositionOpeningAnchor(
+                        side=side,
+                        start_step=step_index,
+                        mature_step=step_index,
+                        anchor_north=current_north,
+                        anchor_east=anchor_east,
+                        anchor_source="door_capture_current",
+                        start_position=started_position,
+                        mature_position=anchor_position,
+                        best_position=best_position,
+                        best_side_avg=best_side_avg,
+                        frames_seen=confirmed_frames,
+                    )
+            else:
+                log("CAPTURE", f"rejected reason={reason}")
+                return None
+
+            if crawl_index < max_crawl_steps and crawl_step > 0.0:
+                current_east += crawl_step
+                log("CAPTURE", f"crawl step={crawl_index + 1}/{max_crawl_steps}, next_east={current_east:.2f}")
+
+        log("CAPTURE", "rejected reason=insufficient_confirmation")
+        return None
+
     async def inspect_position_opening(anchor: PositionOpeningAnchor) -> None:
         nonlocal current_north, current_east
         if len(events) >= max_inspections:
@@ -3117,25 +3222,34 @@ async def run_position_room_inspection_steps(
         side = anchor.side
         anchor_north = anchor.anchor_north
         anchor_east = anchor.anchor_east
-        log(
-            "POS",
-            f"aligning to {side} candidate anchor before entry: "
-            f"N={anchor_north:.2f}, E={anchor_east:.2f}, start_step={anchor.start_step + 1}, mature_step={anchor.mature_step + 1}",
-        )
-        await goto_position_ned(
-            drone,
-            rclpy,
-            monitor,
-            position_type,
-            anchor_north,
-            anchor_east,
-            down_m,
-            yaw_deg,
-            hold_sec,
-            f"align {side} opening anchor",
-        )
-        current_north = anchor_north
-        current_east = anchor_east
+        if anchor.anchor_source == "door_capture_current":
+            log(
+                "POS",
+                f"using no-backtrack {side} capture anchor before entry: "
+                f"N={anchor_north:.2f}, E={anchor_east:.2f}, step={anchor.mature_step + 1}",
+            )
+            current_north = anchor_north
+            current_east = anchor_east
+        else:
+            log(
+                "POS",
+                f"aligning to {side} candidate anchor before entry: "
+                f"N={anchor_north:.2f}, E={anchor_east:.2f}, start_step={anchor.start_step + 1}, mature_step={anchor.mature_step + 1}",
+            )
+            await goto_position_ned(
+                drone,
+                rclpy,
+                monitor,
+                position_type,
+                anchor_north,
+                anchor_east,
+                down_m,
+                yaw_deg,
+                hold_sec,
+                f"align {side} opening anchor",
+            )
+            current_north = anchor_north
+            current_east = anchor_east
         opening_id = f"{side}@north={anchor_north:.1f},east={anchor_east:.1f}"
         baseline = await sample_gas_at_position(
             drone,
@@ -3216,7 +3330,7 @@ async def run_position_room_inspection_steps(
             "baseline_position": baseline.position,
             "inspection_position": inspection.position,
             "entry_anchor_position": {"north": round(anchor_north, 3), "east": round(anchor_east, 3), "altitude": -down_m},
-            "entry_anchor_source": "candidate_start",
+            "entry_anchor_source": anchor.anchor_source,
             "candidate_start_position": position_as_event_dict(anchor.start_position),
             "candidate_mature_position": position_as_event_dict(anchor.mature_position),
             "candidate_best_position": position_as_event_dict(anchor.best_position),
@@ -3267,6 +3381,23 @@ async def run_position_room_inspection_steps(
             hold_sec,
             f"corridor step {step_index + 1}/{step_count}",
         )
+        if args.enable_no_backtrack_door_capture and len(events) < max_inspections:
+            scan = monitor.decision_snapshot()
+            opening_side = capture_candidate_side(scan)
+            if opening_side is not None:
+                log(
+                    "CAPTURE",
+                    f"candidate side={opening_side} detected after corridor step {step_index + 1}; "
+                    "pausing normal stepping for door capture",
+                )
+                anchor = await try_no_backtrack_capture(step_index, opening_side)
+                active_candidate = None
+                if anchor is not None:
+                    await inspect_position_opening(anchor)
+                if len(events) >= max_inspections:
+                    log("POS", "max inspections reached; remaining steps only follow position corridor")
+                continue
+
         anchor = await update_candidate(step_index, "post-step")
         if anchor is not None and len(events) < max_inspections:
             await inspect_position_opening(anchor)
