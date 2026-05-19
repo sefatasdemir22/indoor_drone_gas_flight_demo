@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import math
 import random
 import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+from typing import Any
 
 DEFAULT_SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
 
@@ -49,6 +52,16 @@ class ScanStats:
     inf_count: int
     valid_ratio: float
     ready: bool
+
+
+@dataclass(frozen=True)
+class FrontSectorStats:
+    sample_count: int
+    valid_count: int
+    finite_count: int
+    inf_count: int
+    valid_ratio: float
+    min_finite_distance: float | None
 
 
 @dataclass(frozen=True)
@@ -102,11 +115,32 @@ class MissionMemory:
     right_open_frames: int = 0
 
 
+@dataclass
+class OpeningCandidateState:
+    active_side: str
+    start_step: int
+    start_position: object | None
+    best_position: object | None
+    best_side_avg: float
+    frames_seen: int
+    last_seen_step: int
+    best_front_distance: float | None
+
+
 @dataclass(frozen=True)
 class TakeoffAltitudeResult:
     confirmed: bool
     safe_hover_altitude: bool
     last_altitude_m: float
+
+
+@dataclass(frozen=True)
+class GasSampleSummary:
+    label: str
+    sample_count: int
+    avg_ppm: float
+    max_ppm: float
+    position: dict[str, float] | None
 
 
 OPENING_CANDIDATES: tuple[OpeningCandidate, ...] = (
@@ -154,6 +188,11 @@ def parse_args() -> argparse.Namespace:
         help="Run a low-speed body-frame forward movement check with front scan safety.",
     )
     parser.add_argument(
+        "--room-inspection-check",
+        action="store_true",
+        help="Run corridor-follow with short opening inspections and simulated gas candidate event logging.",
+    )
+    parser.add_argument(
         "--axis-calibration-check",
         action="store_true",
         help="Run offboard zero-hover plus short north/east NED pulses to identify the usable corridor axis.",
@@ -168,12 +207,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--side-stop-distance", type=float, default=0.7)
     parser.add_argument("--front-stop-distance", type=float, default=1.0)
     parser.add_argument("--front-clear-distance", type=float, default=1.3)
+    parser.add_argument("--front-unavailable-retry-seconds", type=float, default=1.0)
+    parser.add_argument("--front-unavailable-retry-rate-hz", type=float, default=5.0)
+    parser.add_argument("--front-unavailable-max-events", type=int, default=3)
     parser.add_argument("--min-valid-samples", type=int, default=5)
     parser.add_argument("--min-valid-ratio", type=float, default=0.35)
     parser.add_argument("--opening-confirm-frames", type=int, default=2)
     parser.add_argument("--front-scan-topic", default="/drone/front_scan")
     parser.add_argument("--left-scan-topic", default="/drone/left_scan")
     parser.add_argument("--right-scan-topic", default="/drone/right_scan")
+    parser.add_argument("--front-decision-scan-topic", default="/drone/front_decision_scan")
+    parser.add_argument("--left-decision-scan-topic", default="/drone/left_decision_scan")
+    parser.add_argument("--right-decision-scan-topic", default="/drone/right_decision_scan")
     parser.add_argument("--scan-monitor-duration-seconds", type=float, default=10.0)
     parser.add_argument("--scan-log-rate-hz", type=float, default=2.0)
     parser.add_argument("--scan-warmup-seconds", type=float, default=0.5)
@@ -212,6 +257,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-side-speed", type=float, default=0.12)
     parser.add_argument("--probe-duration-seconds", type=float, default=1.5)
     parser.add_argument("--probe-max-count", type=int, default=1)
+    parser.add_argument("--max-inspections", type=int, default=2)
+    parser.add_argument("--inspection-side-speed", type=float, default=0.12)
+    parser.add_argument("--inspection-enter-seconds", type=float, default=1.8)
+    parser.add_argument("--inspection-hover-seconds", type=float, default=3.0)
+    parser.add_argument("--inspection-exit-seconds", type=float, default=1.8)
+    parser.add_argument("--inspection-enter-distance", type=float, default=0.5)
+    parser.add_argument("--inspection-exit-tolerance", type=float, default=0.5)
+    parser.add_argument("--inspection-enter-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--inspection-exit-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--inspection-cooldown-steps", type=int, default=2)
+    parser.add_argument("--opening-alignment-forward-distance", type=float, default=0.5)
+    parser.add_argument("--opening-alignment-timeout-seconds", type=float, default=4.0)
+    parser.add_argument("--opening-alignment-confirm-frames", type=int, default=2)
+    parser.add_argument("--disable-opening-alignment", action="store_true")
+    parser.add_argument("--opening-min-forward-progress", type=float, default=1.0)
+    parser.add_argument("--opening-min-persistence-frames", type=int, default=3)
+    parser.add_argument("--opening-peak-drop-distance", type=float, default=0.25)
+    parser.add_argument("--opening-require-front-clear", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gas-scenario", default="possible_gas_zone_4")
+    parser.add_argument("--gas-seed", type=int, default=1)
+    parser.add_argument("--gas-sample-rate-hz", type=float, default=5.0)
+    parser.add_argument("--baseline-sample-seconds", type=float, default=1.5)
+    parser.add_argument("--inspection-sample-seconds", type=float, default=3.0)
+    parser.add_argument("--gas-delta-threshold", type=float, default=15.0)
+    parser.add_argument("--gas-absolute-threshold", type=float, default=35.0)
+    parser.add_argument("--background-ppm", type=float, default=5.0)
+    parser.add_argument("--peak-ppm", type=float, default=120.0)
+    parser.add_argument("--sigma", type=float, default=1.8)
+    parser.add_argument("--noise-std", type=float, default=1.2)
+    parser.add_argument("--inspection-events-output", type=Path, default=Path("results") / "opening_inspection_events.json")
     parser.add_argument("--move-rate-hz", type=float, default=10.0)
     parser.add_argument("--pause-between-steps", type=float, default=0.75)
     parser.add_argument("--front-sector-deg", type=float, default=35.0)
@@ -439,10 +514,31 @@ class LaserScanMonitor:
         self.latest_front: object | None = None
         self.latest_left: object | None = None
         self.latest_right: object | None = None
+        self.latest_front_decision: object | None = None
+        self.latest_left_decision: object | None = None
+        self.latest_right_decision: object | None = None
         self.node = self.rclpy.create_node("opening_based_scan_monitor")
         self.node.create_subscription(laser_scan_type, args.front_scan_topic, self._front_callback, 10)
         self.node.create_subscription(laser_scan_type, args.left_scan_topic, self._left_callback, 10)
         self.node.create_subscription(laser_scan_type, args.right_scan_topic, self._right_callback, 10)
+        self.node.create_subscription(
+            laser_scan_type,
+            args.front_decision_scan_topic,
+            self._front_decision_callback,
+            10,
+        )
+        self.node.create_subscription(
+            laser_scan_type,
+            args.left_decision_scan_topic,
+            self._left_decision_callback,
+            10,
+        )
+        self.node.create_subscription(
+            laser_scan_type,
+            args.right_decision_scan_topic,
+            self._right_decision_callback,
+            10,
+        )
 
     def _front_callback(self, msg: object) -> None:
         self.latest_front = msg
@@ -453,13 +549,56 @@ class LaserScanMonitor:
     def _right_callback(self, msg: object) -> None:
         self.latest_right = msg
 
+    def _front_decision_callback(self, msg: object) -> None:
+        self.latest_front_decision = msg
+
+    def _left_decision_callback(self, msg: object) -> None:
+        self.latest_left_decision = msg
+
+    def _right_decision_callback(self, msg: object) -> None:
+        self.latest_right_decision = msg
+
     def has_all_messages(self) -> bool:
-        return self.latest_front is not None and self.latest_left is not None and self.latest_right is not None
+        return (
+            self.latest_front is not None
+            and self.latest_left is not None
+            and self.latest_right is not None
+            and self.latest_front_decision is not None
+            and self.latest_left_decision is not None
+            and self.latest_right_decision is not None
+        )
 
     def snapshot(self) -> ScanSnapshot:
         front_stats = scan_stats(self.latest_front)
         left_stats = scan_stats(self.latest_left)
         right_stats = scan_stats(self.latest_right)
+        return ScanSnapshot(
+            front_min=front_stats.min_distance,
+            left_min=left_stats.min_distance,
+            right_min=right_stats.min_distance,
+            left_avg=left_stats.avg_distance,
+            right_avg=right_stats.avg_distance,
+            front_ready=front_stats.ready,
+            left_ready=left_stats.ready,
+            right_ready=right_stats.ready,
+            front_valid_count=front_stats.valid_count,
+            left_valid_count=left_stats.valid_count,
+            right_valid_count=right_stats.valid_count,
+            front_finite_count=front_stats.finite_count,
+            left_finite_count=left_stats.finite_count,
+            right_finite_count=right_stats.finite_count,
+            front_inf_count=front_stats.inf_count,
+            left_inf_count=left_stats.inf_count,
+            right_inf_count=right_stats.inf_count,
+            front_valid_ratio=front_stats.valid_ratio,
+            left_valid_ratio=left_stats.valid_ratio,
+            right_valid_ratio=right_stats.valid_ratio,
+        )
+
+    def decision_snapshot(self) -> ScanSnapshot:
+        front_stats = scan_stats(self.latest_front_decision)
+        left_stats = scan_stats(self.latest_left_decision)
+        right_stats = scan_stats(self.latest_right_decision)
         return ScanSnapshot(
             front_min=front_stats.min_distance,
             left_min=left_stats.min_distance,
@@ -556,6 +695,65 @@ def side_open_for_corridor_detection(scan: ScanSnapshot, side: str, args: argpar
             return True
         return scan.right_avg >= side_open
     return False
+
+
+def side_decision_diagnostics(scan: ScanSnapshot, side: str, args: argparse.Namespace) -> tuple[bool, str, str]:
+    min_valid_samples = max(1, args.min_valid_samples)
+    min_valid_ratio = max(0.0, min(1.0, args.min_valid_ratio))
+    side_open = max(0.0, args.side_open_distance)
+
+    if side == "left":
+        ready = scan.left_ready
+        min_distance = scan.left_min
+        avg_distance = scan.left_avg
+        valid_count = scan.left_valid_count
+        finite_count = scan.left_finite_count
+        inf_count = scan.left_inf_count
+        valid_ratio = scan.left_valid_ratio
+    elif side == "right":
+        ready = scan.right_ready
+        min_distance = scan.right_min
+        avg_distance = scan.right_avg
+        valid_count = scan.right_valid_count
+        finite_count = scan.right_finite_count
+        inf_count = scan.right_inf_count
+        valid_ratio = scan.right_valid_ratio
+    else:
+        return False, "invalid_side", f"side={side}"
+
+    metrics = (
+        f"side={side} min={min_distance:.2f} avg={avg_distance:.2f} "
+        f"valid={valid_count} finite={finite_count} inf={inf_count} "
+        f"ratio={valid_ratio:.2f} threshold={side_open:.2f}"
+    )
+
+    if not ready:
+        return False, "not_ready", metrics
+    if valid_count < min_valid_samples:
+        return False, "valid_count_low", f"{metrics} min_valid_samples={min_valid_samples}"
+    if valid_ratio < min_valid_ratio:
+        return False, "valid_ratio_low", f"{metrics} min_valid_ratio={min_valid_ratio:.2f}"
+    if finite_count == 0 and inf_count >= min_valid_samples:
+        return True, "all_inf_clear", metrics
+    if avg_distance >= side_open:
+        return True, "avg_above_threshold", metrics
+    return False, "avg_below_threshold", metrics
+
+
+def side_avg_for_snapshot(scan: ScanSnapshot, side: str) -> float:
+    if side == "left":
+        return scan.left_avg
+    if side == "right":
+        return scan.right_avg
+    return math.inf
+
+
+def side_min_for_snapshot(scan: ScanSnapshot, side: str) -> float:
+    if side == "left":
+        return scan.left_min
+    if side == "right":
+        return scan.right_min
+    return math.inf
 
 
 def side_open_for_probe_confirm(scan: ScanSnapshot, side: str, args: argparse.Namespace) -> bool:
@@ -658,6 +856,9 @@ def run_scan_monitor(args: argparse.Namespace) -> int:
     log("CONFIG", f"front_scan_topic={args.front_scan_topic}")
     log("CONFIG", f"left_scan_topic={args.left_scan_topic}")
     log("CONFIG", f"right_scan_topic={args.right_scan_topic}")
+    log("CONFIG", f"front_decision_scan_topic={args.front_decision_scan_topic}")
+    log("CONFIG", f"left_decision_scan_topic={args.left_decision_scan_topic}")
+    log("CONFIG", f"right_decision_scan_topic={args.right_decision_scan_topic}")
     log("CONFIG", f"duration_seconds={duration_sec:.1f}")
     log("CONFIG", f"scan_log_rate_hz={log_rate_hz:.1f}")
     log("CONFIG", f"scan_warmup_seconds={warmup_sec:.1f}")
@@ -680,12 +881,15 @@ def run_scan_monitor(args: argparse.Namespace) -> int:
                     "waiting for scan readiness: "
                     f"front_ready={monitor.latest_front is not None} "
                     f"left_ready={monitor.latest_left is not None} "
-                    f"right_ready={monitor.latest_right is not None}",
+                    f"right_ready={monitor.latest_right is not None} "
+                    f"front_decision_ready={monitor.latest_front_decision is not None} "
+                    f"left_decision_ready={monitor.latest_left_decision is not None} "
+                    f"right_decision_ready={monitor.latest_right_decision is not None}",
                 )
                 log("ACTION", "simulated wait: scan data not ready")
                 next_log_at = now + log_interval_sec
                 continue
-            scan = monitor.snapshot()
+            scan = monitor.decision_snapshot()
             decision = decide_corridor_action(scan, memory, args)
             log_scan_monitor_snapshot(scan)
             log("DECIDE", f"corridor_action={decision.value}")
@@ -748,6 +952,15 @@ def import_velocity_body_yawspeed() -> object | None:
     return VelocityBodyYawspeed
 
 
+def import_gas_model() -> tuple[object, object, object] | None:
+    try:
+        from demo_tools.gas_sensor_node import POSSIBLE_GAS_ZONES, compute_ppm, resolve_scenario
+    except Exception as exc:
+        print(f"Could not import gas model helpers: {exc}")
+        return None
+    return compute_ppm, resolve_scenario, POSSIBLE_GAS_ZONES
+
+
 def create_scan_monitor(args: argparse.Namespace) -> tuple[object, LaserScanMonitor] | None:
     dependencies = import_ros2_scan_dependencies()
     if dependencies is None:
@@ -781,10 +994,10 @@ async def wait_for_scan_readiness(rclpy: object, monitor: LaserScanMonitor, args
     log("SCAN", f"waiting for scan readiness, timeout={timeout_sec:.1f}s")
     while rclpy.ok() and time.monotonic() - started_at < timeout_sec:
         rclpy.spin_once(monitor.node, timeout_sec=0.05)
-        scan = monitor.snapshot()
+        scan = monitor.decision_snapshot()
         if monitor.has_all_messages() and scan_ready_for_mission(scan, args):
             log_scan_monitor_snapshot(scan)
-            log("SCAN", "front/left/right scan readiness confirmed")
+            log("SCAN", "front/left/right wide and decision scan readiness confirmed")
             return True
 
         now = time.monotonic()
@@ -794,7 +1007,10 @@ async def wait_for_scan_readiness(rclpy: object, monitor: LaserScanMonitor, args
                 "waiting for scan readiness: "
                 f"front_ready={monitor.latest_front is not None} "
                 f"left_ready={monitor.latest_left is not None} "
-                f"right_ready={monitor.latest_right is not None}",
+                f"right_ready={monitor.latest_right is not None} "
+                f"front_decision_ready={monitor.latest_front_decision is not None} "
+                f"left_decision_ready={monitor.latest_left_decision is not None} "
+                f"right_decision_ready={monitor.latest_right_decision is not None}",
             )
             next_log_at = now + log_interval_sec
         await asyncio.sleep(0.02)
@@ -825,7 +1041,7 @@ async def log_airborne_scan_checks(
             await asyncio.sleep(0.02)
             continue
 
-        scan = monitor.snapshot()
+        scan = monitor.decision_snapshot()
         decision = decide_corridor_action(scan, memory, args)
         log_scan_monitor_snapshot(scan)
         log("DECIDE", f"corridor_action={decision.value}")
@@ -956,6 +1172,14 @@ async def read_position_ned(drone: object, label: str) -> object | None:
     return position
 
 
+async def read_position_ned_quiet(drone: object) -> object | None:
+    try:
+        position_velocity = await asyncio.wait_for(anext(drone.telemetry.position_velocity_ned()), timeout=2.0)
+    except Exception:
+        return None
+    return position_velocity.position
+
+
 def log_position_delta(label: str, position: object | None, start_position: object | None) -> None:
     if position is None or start_position is None:
         log("MOVE", f"{label} displacement unavailable")
@@ -979,6 +1203,35 @@ def horizontal_magnitude(delta_north: float, delta_east: float) -> float:
     return math.sqrt(delta_north * delta_north + delta_east * delta_east)
 
 
+def horizontal_distance(position: object | None, anchor_position: object | None) -> float | None:
+    if position is None or anchor_position is None:
+        return None
+    delta_north, delta_east, _delta_down = position_delta(position, anchor_position)
+    return horizontal_magnitude(delta_north, delta_east)
+
+
+def position_as_event_dict(position: object | None) -> dict[str, float] | None:
+    if position is None:
+        return None
+    return {
+        "north": round(float(position.north_m), 3),
+        "east": round(float(position.east_m), 3),
+        "altitude": round(max(0.0, -float(position.down_m)), 3),
+    }
+
+
+def opening_id_for_position(side: str, position: object | None) -> str:
+    if position is None:
+        return f"{side}@unknown"
+    north_bucket = round(float(position.north_m) * 2.0) / 2.0
+    east_bucket = round(float(position.east_m) * 2.0) / 2.0
+    return f"{side}@north={north_bucket:.1f},east={east_bucket:.1f}"
+
+
+def opening_already_inspected(opening_id: str, inspected_ids: set[str]) -> bool:
+    return opening_id in inspected_ids
+
+
 def valid_laser_range(distance: float, msg: object) -> bool:
     if not math.isfinite(distance) or distance <= 0.0:
         return False
@@ -992,34 +1245,203 @@ def valid_laser_range(distance: float, msg: object) -> bool:
 
 
 def front_sector_min_distance(msg: object | None, sector_deg: float) -> float | None:
+    stats = front_sector_stats(msg, sector_deg)
+    return stats.min_finite_distance
+
+
+def front_sector_stats(msg: object | None, sector_deg: float) -> FrontSectorStats:
     if msg is None:
-        return None
+        return FrontSectorStats(
+            sample_count=0,
+            valid_count=0,
+            finite_count=0,
+            inf_count=0,
+            valid_ratio=0.0,
+            min_finite_distance=None,
+        )
 
     sector_half_rad = math.radians(max(0.0, sector_deg) / 2.0)
     angle = float(getattr(msg, "angle_min", 0.0))
     angle_increment = float(getattr(msg, "angle_increment", 0.0))
-    valid_ranges: list[float] = []
+    finite_ranges: list[float] = []
+    inf_count = 0
+    sample_count = 0
     for distance in getattr(msg, "ranges", []):
-        if abs(angle) <= sector_half_rad and valid_laser_range(float(distance), msg):
-            valid_ranges.append(float(distance))
+        if abs(angle) <= sector_half_rad:
+            sample_count += 1
+            value = float(distance)
+            if math.isinf(value):
+                inf_count += 1
+            elif valid_laser_range(value, msg):
+                finite_ranges.append(value)
         angle += angle_increment
 
-    return min(valid_ranges) if valid_ranges else None
+    finite_count = len(finite_ranges)
+    valid_count = finite_count + inf_count
+    valid_ratio = valid_count / sample_count if sample_count else 0.0
+    min_finite = min(finite_ranges) if finite_ranges else None
+    return FrontSectorStats(
+        sample_count=sample_count,
+        valid_count=valid_count,
+        finite_count=finite_count,
+        inf_count=inf_count,
+        valid_ratio=valid_ratio,
+        min_finite_distance=min_finite,
+    )
+
+
+def front_motion_status_for_scan(msg: object | None, args: argparse.Namespace, source_label: str) -> str:
+    stats = front_sector_stats(msg, args.front_sector_deg)
+    min_valid_samples = max(1, args.min_valid_samples)
+    min_valid_ratio = max(0.0, min(1.0, args.min_valid_ratio))
+
+    if stats.sample_count == 0:
+        log("SAFETY", f"{source_label} front sector unavailable")
+        return "unavailable"
+
+    if stats.min_finite_distance is not None and stats.min_finite_distance < max(0.0, args.front_stop_distance):
+        log(
+            "SAFETY",
+            f"{source_label} front_sector_min={stats.min_finite_distance:.2f} m, "
+            f"sector={max(0.0, args.front_sector_deg):.1f} deg",
+        )
+        log("SAFETY", f"{source_label} front obstacle detected; stopping corridor motion")
+        return "blocked"
+
+    if stats.valid_count < min_valid_samples or stats.valid_ratio < min_valid_ratio:
+        log(
+            "SAFETY",
+            f"{source_label} front sector sparse; "
+            f"valid={stats.valid_count}/{stats.sample_count}, ratio={stats.valid_ratio:.2f}",
+        )
+        return "unavailable"
+
+    if stats.min_finite_distance is None:
+        log(
+            "SAFETY",
+            f"{source_label} front sector clear: no finite obstacle, inf_rays={stats.inf_count}",
+        )
+        return "clear"
+
+    log(
+        "SAFETY",
+        f"{source_label} front_sector_min={stats.min_finite_distance:.2f} m, "
+        f"sector={max(0.0, args.front_sector_deg):.1f} deg",
+    )
+    if stats.min_finite_distance >= max(args.front_stop_distance, args.front_clear_distance):
+        log("SAFETY", f"{source_label} front sector clear")
+    return "clear"
+
+
+def front_motion_status(monitor: LaserScanMonitor, args: argparse.Namespace) -> str:
+    wide_status = front_motion_status_for_scan(monitor.latest_front, args, "wide")
+    if wide_status in {"clear", "blocked"}:
+        return wide_status
+
+    log("SAFETY", "wide front sector unavailable; checking decision front")
+    decision_status = front_motion_status_for_scan(monitor.latest_front_decision, args, "decision")
+    if decision_status == "clear":
+        log("SAFETY", "decision front fallback clear")
+    elif decision_status == "blocked":
+        log("SAFETY", "decision front fallback blocked")
+    else:
+        log("SAFETY", "front sector unavailable on wide and decision scans")
+    return decision_status
+
+
+def front_clearance_for_candidate(monitor: LaserScanMonitor, args: argparse.Namespace) -> tuple[bool, float | None]:
+    min_valid_samples = max(1, args.min_valid_samples)
+    min_valid_ratio = max(0.0, min(1.0, args.min_valid_ratio))
+    front_clear_distance = max(0.0, args.front_clear_distance)
+
+    for msg in (monitor.latest_front, monitor.latest_front_decision):
+        stats = front_sector_stats(msg, args.front_sector_deg)
+        if stats.sample_count == 0:
+            continue
+        if stats.valid_count < min_valid_samples or stats.valid_ratio < min_valid_ratio:
+            continue
+        if stats.min_finite_distance is None:
+            return True, math.inf
+        return stats.min_finite_distance >= front_clear_distance, stats.min_finite_distance
+
+    return False, None
 
 
 def front_motion_allowed(monitor: LaserScanMonitor, args: argparse.Namespace) -> bool:
-    front_min = front_sector_min_distance(monitor.latest_front, args.front_sector_deg)
-    if front_min is None:
-        log("SAFETY", "front sector unavailable; stopping corridor motion")
+    return front_motion_status(monitor, args) == "clear"
+
+
+async def front_motion_allowed_with_retry(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+) -> bool:
+    status = front_motion_status(monitor, args)
+    if status == "clear":
+        setattr(args, "_front_unavailable_events", 0)
+        return True
+    if status == "blocked":
         return False
 
-    log("SAFETY", f"front_sector_min={front_min:.2f} m, sector={max(0.0, args.front_sector_deg):.1f} deg")
-    if front_min < max(0.0, args.front_stop_distance):
-        log("SAFETY", "front obstacle detected; stopping corridor motion")
+    unavailable_events = int(getattr(args, "_front_unavailable_events", 0)) + 1
+    setattr(args, "_front_unavailable_events", unavailable_events)
+    if unavailable_events > max(0, args.front_unavailable_max_events):
+        log("SAFETY", "front sector unavailable persists; ending mission safely")
         return False
 
-    if front_min >= max(args.front_stop_distance, args.front_clear_distance):
-        log("SAFETY", "front sector clear")
+    retry_seconds = max(0.0, args.front_unavailable_retry_seconds)
+    retry_rate_hz = max(0.1, args.front_unavailable_retry_rate_hz)
+    retry_interval = 1.0 / retry_rate_hz
+    log(
+        "SAFETY",
+        "front sector unavailable; holding and retrying scan "
+        f"({unavailable_events}/{max(0, args.front_unavailable_max_events)})",
+    )
+    await send_zero_body_velocity(drone, velocity_type)
+
+    retry_started_at = time.monotonic()
+    while time.monotonic() - retry_started_at < retry_seconds:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        await asyncio.sleep(retry_interval)
+        status = front_motion_status(monitor, args)
+        if status == "clear":
+            log("SAFETY", "front sector recovered")
+            setattr(args, "_front_unavailable_events", 0)
+            return True
+        if status == "blocked":
+            return False
+
+    log("SAFETY", "front sector unavailable after retry")
+    return False
+
+
+def side_motion_allowed(monitor: LaserScanMonitor, args: argparse.Namespace, side: str) -> bool:
+    scan = monitor.decision_snapshot()
+    side = side.lower()
+    if side == "left":
+        ready = scan.left_ready
+        valid_count = scan.left_valid_count
+        valid_ratio = scan.left_valid_ratio
+        side_min = scan.left_min
+    elif side == "right":
+        ready = scan.right_ready
+        valid_count = scan.right_valid_count
+        valid_ratio = scan.right_valid_ratio
+        side_min = scan.right_min
+    else:
+        log("SAFETY", f"unknown side safety direction: {side}")
+        return False
+
+    if not ready or valid_count < max(1, args.min_valid_samples) or valid_ratio < max(0.0, args.min_valid_ratio):
+        log("SAFETY", f"{side} scan unavailable or sparse; stopping lateral motion")
+        return False
+
+    log("SAFETY", f"{side}_min={format_distance(side_min)} m")
+    if side_min < max(0.0, args.side_stop_distance):
+        log("SAFETY", f"{side} obstacle detected; stopping lateral motion")
+        return False
     return True
 
 
@@ -1074,7 +1496,7 @@ async def run_opening_probe(
         log("PROBE", f"skipping {side} opening probe because speed or duration is zero")
         return
 
-    if not front_motion_allowed(monitor, args):
+    if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
         log("PROBE", f"front safety blocked before {side} opening probe")
         return
 
@@ -1100,7 +1522,7 @@ async def run_opening_probe(
         if now >= next_decision_log_at:
             log_passive_corridor_decision(monitor, memory, args, f"probe side={side}")
             next_decision_log_at = now + decision_log_interval_sec
-        if not front_motion_allowed(monitor, args):
+        if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
             log("PROBE", f"front safety stopped {side} opening probe")
             await send_zero_body_velocity(drone, velocity_type)
             return
@@ -1111,6 +1533,288 @@ async def run_opening_probe(
     await asyncio.sleep(0.2)
     end_position = await read_position_ned(drone, f"{side} probe end")
     log_position_delta(f"{side} probe", end_position, start_position)
+
+
+async def sample_gas_for_duration(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+    label: str,
+    duration_sec: float,
+    compute_ppm: object,
+    active_sources: list[dict[str, Any]],
+    rng: random.Random,
+) -> GasSampleSummary:
+    duration_sec = max(0.0, duration_sec)
+    rate_hz = max(0.1, args.gas_sample_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    samples: list[float] = []
+    last_position: object | None = None
+    started_at = time.monotonic()
+    log("GAS", f"{label} sampling for {duration_sec:.1f}s at {rate_hz:.1f} Hz")
+
+    while time.monotonic() - started_at < duration_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        position = await read_position_ned(drone, f"{label} sample")
+        if position is not None:
+            last_position = position
+            ppm, _nearest_distance = compute_ppm(
+                x=float(position.north_m),
+                y=float(position.east_m),
+                active_sources=active_sources,
+                background_ppm=args.background_ppm,
+                peak_ppm=args.peak_ppm,
+                sigma=args.sigma,
+                rng=rng,
+                noise_std=args.noise_std,
+            )
+            samples.append(float(ppm))
+            log("GAS", f"{label} sample ppm={ppm:.2f}")
+        await send_zero_body_velocity(drone, velocity_type)
+        await asyncio.sleep(interval_sec)
+
+    if samples:
+        avg_ppm = sum(samples) / len(samples)
+        max_ppm = max(samples)
+    else:
+        avg_ppm = 0.0
+        max_ppm = 0.0
+    log("GAS", f"{label}_avg={avg_ppm:.2f} ppm, max={max_ppm:.2f} ppm, samples={len(samples)}")
+    return GasSampleSummary(
+        label=label,
+        sample_count=len(samples),
+        avg_ppm=avg_ppm,
+        max_ppm=max_ppm,
+        position=position_as_event_dict(last_position),
+    )
+
+
+async def run_lateral_body_motion(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+    label: str,
+    right_speed: float,
+    duration_sec: float,
+) -> None:
+    duration_sec = max(0.0, duration_sec)
+    rate_hz = max(1.0, args.move_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    if duration_sec == 0.0:
+        return
+    if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
+        raise RuntimeError(f"front safety blocked before {label}")
+
+    log("INSPECT", f"{label}: right_speed={right_speed:.2f} m/s, duration={duration_sec:.1f}s")
+    started_at = time.monotonic()
+    while time.monotonic() - started_at < duration_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
+            await send_zero_body_velocity(drone, velocity_type)
+            raise RuntimeError(f"front safety stopped {label}")
+        await drone.offboard.set_velocity_body(velocity_type(0.0, right_speed, 0.0, 0.0))
+        await asyncio.sleep(interval_sec)
+    await send_zero_body_velocity(drone, velocity_type)
+    await asyncio.sleep(0.2)
+
+
+async def run_distance_based_lateral_body_motion(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+    label: str,
+    right_speed: float,
+    anchor_position: object,
+    target_distance_m: float | None,
+    exit_tolerance_m: float | None,
+    timeout_sec: float,
+) -> dict[str, float]:
+    rate_hz = max(1.0, args.move_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    timeout_sec = max(0.1, timeout_sec)
+    target_distance_m = None if target_distance_m is None else max(0.0, target_distance_m)
+    exit_tolerance_m = None if exit_tolerance_m is None else max(0.0, exit_tolerance_m)
+    direction_side = "left" if right_speed < 0.0 else "right"
+
+    if right_speed == 0.0:
+        log("INSPECT", f"{label}: skipping lateral motion because right_speed is zero")
+        return {"actual_distance_m": 0.0, "final_anchor_distance_m": 0.0, "elapsed_seconds": 0.0}
+    if target_distance_m == 0.0:
+        log("INSPECT", f"{label}: skipping lateral enter because target distance is zero")
+        return {"actual_distance_m": 0.0, "final_anchor_distance_m": 0.0, "elapsed_seconds": 0.0}
+
+    mode = "enter" if target_distance_m is not None else "exit"
+    if mode == "enter":
+        log(
+            "INSPECT",
+            f"{label}: distance-based enter, right_speed={right_speed:.2f} m/s, "
+            f"target={target_distance_m:.2f} m, timeout={timeout_sec:.1f}s",
+        )
+    else:
+        log(
+            "INSPECT",
+            f"{label}: distance-based exit, right_speed={right_speed:.2f} m/s, "
+            f"tolerance={exit_tolerance_m:.2f} m, timeout={timeout_sec:.1f}s",
+        )
+
+    started_at = time.monotonic()
+    last_position: object | None = None
+    last_anchor_distance = horizontal_distance(await read_position_ned_quiet(drone), anchor_position)
+    max_anchor_distance = last_anchor_distance if last_anchor_distance is not None else 0.0
+    next_progress_log_at = started_at
+    progress_log_interval_sec = 1.0 / max(0.1, args.scan_log_rate_hz)
+
+    while time.monotonic() - started_at < timeout_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
+            await send_zero_body_velocity(drone, velocity_type)
+            raise RuntimeError(f"front safety stopped {label}")
+        if not side_motion_allowed(monitor, args, direction_side):
+            await send_zero_body_velocity(drone, velocity_type)
+            raise RuntimeError(f"{direction_side} safety stopped {label}")
+
+        position = await read_position_ned_quiet(drone)
+        if position is not None:
+            last_position = position
+            anchor_distance = horizontal_distance(position, anchor_position)
+            if anchor_distance is not None:
+                last_anchor_distance = anchor_distance
+                max_anchor_distance = max(max_anchor_distance, anchor_distance)
+                now = time.monotonic()
+                if now >= next_progress_log_at:
+                    log("INSPECT", f"{label}: anchor_distance={anchor_distance:.2f} m")
+                    next_progress_log_at = now + progress_log_interval_sec
+                if mode == "enter" and anchor_distance >= target_distance_m:
+                    await send_zero_body_velocity(drone, velocity_type)
+                    log("INSPECT", f"{label}: target distance reached at {anchor_distance:.2f} m")
+                    return {
+                        "actual_distance_m": round(anchor_distance, 3),
+                        "final_anchor_distance_m": round(anchor_distance, 3),
+                        "elapsed_seconds": round(time.monotonic() - started_at, 3),
+                    }
+                if mode == "exit" and anchor_distance <= (exit_tolerance_m or 0.0):
+                    await send_zero_body_velocity(drone, velocity_type)
+                    log("INSPECT", f"{label}: exit tolerance reached at {anchor_distance:.2f} m")
+                    return {
+                        "actual_distance_m": round(max_anchor_distance, 3),
+                        "final_anchor_distance_m": round(anchor_distance, 3),
+                        "elapsed_seconds": round(time.monotonic() - started_at, 3),
+                    }
+
+        await drone.offboard.set_velocity_body(velocity_type(0.0, right_speed, 0.0, 0.0))
+        await asyncio.sleep(interval_sec)
+
+    await send_zero_body_velocity(drone, velocity_type)
+    final_distance = horizontal_distance(last_position, anchor_position)
+    final_distance_text = "unknown" if final_distance is None else f"{final_distance:.2f} m"
+    raise RuntimeError(f"{label} timed out after {timeout_sec:.1f}s; anchor_distance={final_distance_text}")
+
+
+async def run_opening_alignment_gate(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+    side: str,
+) -> bool:
+    if args.disable_opening_alignment:
+        log("ALIGN", f"{side} opening alignment disabled; accepting candidate")
+        return True
+
+    target_distance_m = max(0.0, args.opening_alignment_forward_distance)
+    timeout_sec = max(0.1, args.opening_alignment_timeout_seconds)
+    rate_hz = max(1.0, args.move_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    forward_speed = abs(float(args.body_forward_speed))
+
+    log("ALIGN", f"candidate {side} opening detected; aligning before inspection")
+    rclpy.spin_once(monitor.node, timeout_sec=0.0)
+    pre_scan = monitor.decision_snapshot()
+    pre_open, pre_reason, pre_metrics = side_decision_diagnostics(pre_scan, side, args)
+    log(
+        "ALIGN",
+        f"pre-align decision scan: open={pre_open} reason={pre_reason} {pre_metrics}",
+    )
+    if target_distance_m > 0.0 and forward_speed > 0.0:
+        anchor_position = await read_position_ned_quiet(drone)
+        if anchor_position is None:
+            raise RuntimeError(f"could not read alignment anchor position for {side} opening")
+
+        log(
+            "ALIGN",
+            f"moving forward for alignment: target={target_distance_m:.2f} m, "
+            f"speed={forward_speed:.2f} m/s, timeout={timeout_sec:.1f}s",
+        )
+        started_at = time.monotonic()
+        last_distance = 0.0
+        while time.monotonic() - started_at < timeout_sec:
+            rclpy.spin_once(monitor.node, timeout_sec=0.0)
+            if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
+                await send_zero_body_velocity(drone, velocity_type)
+                raise RuntimeError(f"front safety stopped {side} opening alignment")
+
+            position = await read_position_ned_quiet(drone)
+            distance = horizontal_distance(position, anchor_position)
+            if distance is not None:
+                last_distance = distance
+                if distance >= target_distance_m:
+                    log("ALIGN", f"alignment forward target reached at {distance:.2f} m")
+                    break
+
+            await drone.offboard.set_velocity_body(velocity_type(forward_speed, 0.0, 0.0, 0.0))
+            await asyncio.sleep(interval_sec)
+        else:
+            log("ALIGN", f"alignment forward timeout; last_distance={last_distance:.2f} m")
+
+        await send_zero_body_velocity(drone, velocity_type)
+        await asyncio.sleep(0.2)
+
+    rclpy.spin_once(monitor.node, timeout_sec=0.05)
+    post_scan = monitor.decision_snapshot()
+    post_open, post_reason, post_metrics = side_decision_diagnostics(post_scan, side, args)
+    log(
+        "ALIGN",
+        f"post-align decision scan: open={post_open} reason={post_reason} {post_metrics}",
+    )
+
+    confirm_frames = max(1, args.opening_alignment_confirm_frames)
+    confirmed_frames = 0
+    for frame_index in range(confirm_frames):
+        rclpy.spin_once(monitor.node, timeout_sec=0.05)
+        scan = monitor.decision_snapshot()
+        open_now, reason, metrics = side_decision_diagnostics(scan, side, args)
+        log(
+            "ALIGN",
+            f"confirm frame {frame_index + 1}/{confirm_frames}: "
+            f"open={open_now} reason={reason} {metrics}",
+        )
+        if open_now:
+            confirmed_frames += 1
+            log("ALIGN", f"{side} opening confirm frame {frame_index + 1}/{confirm_frames}: open")
+        else:
+            log(
+                "ALIGN",
+                f"{side} opening rejected after alignment at frame {frame_index + 1}/{confirm_frames}: "
+                f"reason={reason}",
+            )
+            await send_zero_body_velocity(drone, velocity_type)
+            return False
+        await asyncio.sleep(0.05)
+
+    log("ALIGN", f"{side} opening confirmed after alignment ({confirmed_frames}/{confirm_frames})")
+    return True
+
+
+def write_inspection_events(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 async def warmup_offboard_ned(
@@ -1296,7 +2000,7 @@ async def run_body_corridor_follow_steps(
                 await run_opening_probe(drone, rclpy, monitor, args, velocity_type, opening_side)
                 log("PROBE", "opening probe complete; ending corridor follow and landing")
                 return
-            if not front_motion_allowed(monitor, args):
+            if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
                 await send_zero_body_velocity(drone, velocity_type)
                 break
 
@@ -1325,7 +2029,7 @@ async def run_body_corridor_follow_steps(
                         await run_opening_probe(drone, rclpy, monitor, args, velocity_type, opening_side)
                         log("PROBE", "opening probe complete; ending corridor follow and landing")
                         return
-                if not front_motion_allowed(monitor, args):
+                if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
                     await send_zero_body_velocity(drone, velocity_type)
                     return
                 await drone.offboard.set_velocity_body(
@@ -1367,6 +2071,404 @@ async def run_body_corridor_follow_steps(
             await drone.offboard.stop()
         except Exception as exc:
             log("MOVE", f"offboard stop failed, continuing to land: {exc}")
+
+
+async def run_room_inspection_steps(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    velocity_type: object,
+    compute_ppm: object,
+    active_sources: list[dict[str, Any]],
+    scenario: str,
+    possible_gas_zones: dict[str, tuple[float, float]],
+) -> dict[str, Any]:
+    step_count = max(0, args.corridor_step_count)
+    step_duration_sec = max(0.0, args.corridor_step_duration_seconds)
+    rate_hz = max(1.0, args.move_rate_hz)
+    pause_sec = max(0.0, args.pause_between_steps)
+    interval_sec = 1.0 / rate_hz
+    forward_speed = float(args.body_forward_speed)
+    max_inspections = max(0, args.max_inspections)
+    cooldown_steps = max(0, args.inspection_cooldown_steps)
+    side_speed = abs(float(args.inspection_side_speed))
+    rng = random.Random(args.gas_seed)
+    memory = MissionMemory(
+        visited_openings=set(),
+        skipped_openings=set(),
+        bypass_attempts=0,
+        corridor_x=0.0,
+        seed=args.seed if args.seed is not None else 0,
+    )
+    inspected_ids: set[str] = set()
+    events: list[dict[str, Any]] = []
+    last_inspection_step = -cooldown_steps - 1
+    decision_log_interval_sec = 1.0 / max(0.1, args.scan_log_rate_hz)
+
+    payload: dict[str, Any] = {
+        "requested_scenario": args.gas_scenario,
+        "scenario": scenario,
+        "gas_seed": args.gas_seed,
+        "active_sources": active_sources,
+        "possible_gas_zones": {name: {"x": xy[0], "y": xy[1]} for name, xy in possible_gas_zones.items()},
+        "events": events,
+    }
+
+    log("INSPECT", "room inspection check uses body-frame corridor-follow and lateral enter/exit")
+    log("INSPECT", f"max_inspections={max_inspections}")
+    log("INSPECT", f"inspection_side_speed={side_speed:.2f} m/s")
+    log("INSPECT", f"inspection_enter_distance={max(0.0, args.inspection_enter_distance):.2f} m")
+    log("INSPECT", f"inspection_exit_tolerance={max(0.0, args.inspection_exit_tolerance):.2f} m")
+    log("INSPECT", f"inspection_enter_timeout_seconds={max(0.1, args.inspection_enter_timeout_seconds):.1f}")
+    log("INSPECT", f"inspection_exit_timeout_seconds={max(0.1, args.inspection_exit_timeout_seconds):.1f}")
+    log("INSPECT", f"inspection_hover_seconds={max(0.0, args.inspection_hover_seconds):.1f}")
+    log("ALIGN", f"opening_alignment_enabled={not args.disable_opening_alignment}")
+    log("ALIGN", f"opening_alignment_forward_distance={max(0.0, args.opening_alignment_forward_distance):.2f} m")
+    log("ALIGN", f"opening_alignment_confirm_frames={max(1, args.opening_alignment_confirm_frames)}")
+    log("OPENING", f"opening_min_forward_progress={max(0.0, args.opening_min_forward_progress):.2f} m")
+    log("OPENING", f"opening_min_persistence_frames={max(1, args.opening_min_persistence_frames)}")
+    log("OPENING", f"opening_peak_drop_distance={max(0.0, args.opening_peak_drop_distance):.2f} m")
+    log("OPENING", f"opening_require_front_clear={args.opening_require_front_clear}")
+    log("GAS", f"scenario={scenario}, requested={args.gas_scenario}, active_sources={len(active_sources)}")
+
+    if step_count == 0 or step_duration_sec == 0.0:
+        log("INSPECT", "room inspection skipped because step count or duration is zero")
+        return payload
+
+    active_candidate: OpeningCandidateState | None = None
+
+    async def inspect_opening(side: str, step_index: int) -> None:
+        nonlocal last_inspection_step
+        entry_anchor_position = await read_position_ned(drone, f"{side} opening entry anchor")
+        if entry_anchor_position is None:
+            raise RuntimeError(f"could not read entry anchor position for {side} opening")
+        opening_id = opening_id_for_position(side, entry_anchor_position)
+        if opening_already_inspected(opening_id, inspected_ids):
+            log("INSPECT", f"skip already inspected opening {opening_id}")
+            return
+        if step_index - last_inspection_step < cooldown_steps:
+            log("INSPECT", f"skip opening due to cooldown: step={step_index + 1}, last={last_inspection_step + 1}")
+            return
+        if len(events) >= max_inspections:
+            log("INSPECT", "max inspections reached; continuing corridor-follow without inspection")
+            return
+
+        inspected_ids.add(opening_id)
+        last_inspection_step = step_index
+        await send_zero_body_velocity(drone, velocity_type)
+        baseline = await sample_gas_for_duration(
+            drone,
+            rclpy,
+            monitor,
+            args,
+            velocity_type,
+            "baseline",
+            args.baseline_sample_seconds,
+            compute_ppm,
+            active_sources,
+            rng,
+        )
+
+        enter_right_speed = -side_speed if side == "left" else side_speed
+        enter_result = await run_distance_based_lateral_body_motion(
+            drone,
+            rclpy,
+            monitor,
+            args,
+            velocity_type,
+            f"enter {side} opening",
+            enter_right_speed,
+            entry_anchor_position,
+            args.inspection_enter_distance,
+            None,
+            args.inspection_enter_timeout_seconds,
+        )
+
+        hover_seconds = max(0.0, args.inspection_hover_seconds)
+        if hover_seconds > 0.0:
+            log("INSPECT", f"hovering in/near {side} opening for {hover_seconds:.1f}s")
+            hover_started_at = time.monotonic()
+            while time.monotonic() - hover_started_at < hover_seconds:
+                rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                await send_zero_body_velocity(drone, velocity_type)
+                await asyncio.sleep(0.05)
+
+        inspection = await sample_gas_for_duration(
+            drone,
+            rclpy,
+            monitor,
+            args,
+            velocity_type,
+            "inspection",
+            args.inspection_sample_seconds,
+            compute_ppm,
+            active_sources,
+            rng,
+        )
+
+        delta_ppm = inspection.avg_ppm - baseline.avg_ppm
+        candidate_by_delta = delta_ppm >= max(0.0, args.gas_delta_threshold)
+        candidate_by_absolute = inspection.avg_ppm >= max(0.0, args.gas_absolute_threshold)
+        gas_candidate = candidate_by_delta or candidate_by_absolute
+        if candidate_by_delta:
+            reason = "delta_ppm"
+        elif candidate_by_absolute:
+            reason = "absolute_ppm"
+        else:
+            reason = "below_threshold"
+        log(
+            "GAS",
+            "gas candidate decision: "
+            f"side={side}, baseline={baseline.avg_ppm:.2f}, inspection={inspection.avg_ppm:.2f}, "
+            f"delta={delta_ppm:.2f}, candidate={gas_candidate}, reason={reason}",
+        )
+        if gas_candidate:
+            log("GAS", f"high gas zone candidate detected at opening={opening_id}")
+        else:
+            log("GAS", f"no significant gas increase at opening={opening_id}")
+
+        event = {
+            "inspection_index": len(events) + 1,
+            "side": side,
+            "opening_id": opening_id,
+            "step_index": step_index + 1,
+            "baseline_avg_ppm": round(baseline.avg_ppm, 3),
+            "inspection_avg_ppm": round(inspection.avg_ppm, 3),
+            "delta_ppm": round(delta_ppm, 3),
+            "gas_candidate": gas_candidate,
+            "candidate_reason": reason,
+            "baseline_sample_count": baseline.sample_count,
+            "inspection_sample_count": inspection.sample_count,
+            "baseline_position": baseline.position,
+            "inspection_position": inspection.position,
+            "entry_anchor_position": position_as_event_dict(entry_anchor_position),
+            "enter_target_distance_m": round(max(0.0, args.inspection_enter_distance), 3),
+            "enter_actual_distance_m": enter_result["actual_distance_m"],
+            "enter_elapsed_seconds": enter_result["elapsed_seconds"],
+            "exit_tolerance_m": round(max(0.0, args.inspection_exit_tolerance), 3),
+            "exit_final_distance_m": None,
+            "exit_elapsed_seconds": None,
+        }
+        events.append(event)
+        write_inspection_events(args.inspection_events_output, payload)
+
+        exit_result = await run_distance_based_lateral_body_motion(
+            drone,
+            rclpy,
+            monitor,
+            args,
+            velocity_type,
+            f"exit {side} opening",
+            -enter_right_speed,
+            entry_anchor_position,
+            None,
+            args.inspection_exit_tolerance,
+            args.inspection_exit_timeout_seconds,
+        )
+        event["exit_final_distance_m"] = exit_result["final_anchor_distance_m"]
+        event["exit_elapsed_seconds"] = exit_result["elapsed_seconds"]
+        write_inspection_events(args.inspection_events_output, payload)
+        log("INSPECT", f"returned from {side} inspection; continuing corridor-follow")
+
+    async def try_inspect_opening(side: str, step_index: int) -> None:
+        nonlocal last_inspection_step
+        if len(events) >= max_inspections:
+            log("INSPECT", "max inspections reached; continuing corridor-follow without inspection")
+            return
+        if step_index - last_inspection_step < cooldown_steps:
+            log("INSPECT", f"skip opening due to cooldown: step={step_index + 1}, last={last_inspection_step + 1}")
+            return
+        if not await run_opening_alignment_gate(drone, rclpy, monitor, args, velocity_type, side):
+            log("ALIGN", f"{side} opening skipped after alignment gate")
+            return
+        await inspect_opening(side, step_index)
+
+    def reject_opening_candidate(reason: str) -> None:
+        nonlocal active_candidate
+        if active_candidate is None:
+            return
+        log(
+            "OPENING",
+            f"candidate rejected reason={reason} side={active_candidate.active_side} "
+            f"frames={active_candidate.frames_seen} best={active_candidate.best_side_avg:.2f}",
+        )
+        active_candidate = None
+
+    async def update_opening_candidate(opening_side: str | None, step_index: int, phase: str) -> bool:
+        nonlocal active_candidate
+        if len(events) >= max_inspections:
+            active_candidate = None
+            return False
+
+        scan = monitor.decision_snapshot()
+        side_to_track = opening_side or (active_candidate.active_side if active_candidate is not None else None)
+        if side_to_track is None:
+            return False
+
+        is_open, reason, metrics = side_decision_diagnostics(scan, side_to_track, args)
+        if not is_open:
+            if active_candidate is not None:
+                reject_opening_candidate("lost_opening")
+            elif opening_side is not None:
+                log("OPENING", f"candidate rejected reason=lost_opening {metrics}")
+            return False
+
+        front_clear, front_distance = front_clearance_for_candidate(monitor, args)
+        if args.opening_require_front_clear and not front_clear:
+            if active_candidate is not None:
+                reject_opening_candidate("front_not_clear")
+            else:
+                front_text = "unknown" if front_distance is None else f"{front_distance:.2f}"
+                log(
+                    "OPENING",
+                    f"candidate rejected reason=front_not_clear side={side_to_track} front={front_text}",
+                )
+            return False
+
+        current_position = await read_position_ned_quiet(drone)
+        side_avg = side_avg_for_snapshot(scan, side_to_track)
+        side_min = side_min_for_snapshot(scan, side_to_track)
+
+        if active_candidate is None or active_candidate.active_side != side_to_track:
+            if active_candidate is not None:
+                reject_opening_candidate("side_changed")
+            active_candidate = OpeningCandidateState(
+                active_side=side_to_track,
+                start_step=step_index,
+                start_position=current_position,
+                best_position=current_position,
+                best_side_avg=side_avg,
+                frames_seen=1,
+                last_seen_step=step_index,
+                best_front_distance=front_distance,
+            )
+            log(
+                "OPENING",
+                f"candidate started side={side_to_track} step={step_index + 1} phase={phase} "
+                f"side_avg={side_avg:.2f} side_min={side_min:.2f} reason={reason}",
+            )
+            return False
+
+        active_candidate.frames_seen += 1
+        active_candidate.last_seen_step = step_index
+        if side_avg > active_candidate.best_side_avg:
+            active_candidate.best_side_avg = side_avg
+            active_candidate.best_position = current_position
+            active_candidate.best_front_distance = front_distance
+
+        progress = horizontal_distance(current_position, active_candidate.start_position)
+        progress_text = "unknown" if progress is None else f"{progress:.2f}"
+        front_text = "unknown" if front_distance is None else f"{front_distance:.2f}"
+        log(
+            "OPENING",
+            f"candidate update side={side_to_track} phase={phase} side_avg={side_avg:.2f} "
+            f"side_min={side_min:.2f} best={active_candidate.best_side_avg:.2f} "
+            f"frames={active_candidate.frames_seen} progress={progress_text} front={front_text} "
+            f"valid={scan.left_valid_count if side_to_track == 'left' else scan.right_valid_count} "
+            f"inf={scan.left_inf_count if side_to_track == 'left' else scan.right_inf_count}",
+        )
+
+        min_frames = max(1, args.opening_min_persistence_frames)
+        min_progress = max(0.0, args.opening_min_forward_progress)
+        peak_drop = max(0.0, args.opening_peak_drop_distance)
+        if active_candidate.frames_seen < min_frames:
+            log(
+                "OPENING",
+                f"candidate waiting reason=insufficient_persistence "
+                f"frames={active_candidate.frames_seen}/{min_frames}",
+            )
+            return False
+        if progress is None or progress < min_progress:
+            log(
+                "OPENING",
+                f"candidate waiting reason=insufficient_progress progress={progress_text}/{min_progress:.2f}",
+            )
+            return False
+        if side_avg < active_candidate.best_side_avg - peak_drop:
+            reject_opening_candidate("lost_peak")
+            return False
+
+        side_for_inspection = active_candidate.active_side
+        log(
+            "OPENING",
+            f"candidate mature/confirmed side={side_for_inspection} "
+            f"frames={active_candidate.frames_seen} progress={progress_text} "
+            f"best={active_candidate.best_side_avg:.2f}",
+        )
+        log("OPENING", f"inspection allowed at best candidate side={side_for_inspection}")
+        active_candidate = None
+        await try_inspect_opening(side_for_inspection, step_index)
+        return True
+
+    start_position = await read_position_ned(drone, "inspection start")
+    await warmup_offboard_body(drone, rclpy, monitor, velocity_type, args)
+    log("INSPECT", "starting offboard mode")
+    await drone.offboard.start()
+
+    try:
+        for step_index in range(step_count):
+            tag = f"INSPECT MOVE {step_index + 1}/{step_count}"
+            rclpy.spin_once(monitor.node, timeout_sec=0.05)
+            decision = log_passive_corridor_decision(monitor, memory, args, f"step={step_index + 1}/{step_count} pre")
+            opening_side = opening_side_for_decision(decision)
+            if opening_side is not None or active_candidate is not None:
+                await update_opening_candidate(opening_side, step_index, "pre")
+                if len(events) >= max_inspections:
+                    log("INSPECT", "max inspections reached; remaining steps will only follow corridor")
+            if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
+                await send_zero_body_velocity(drone, velocity_type)
+                break
+
+            log(tag, f"body velocity: forward={forward_speed:.2f} m/s")
+            step_started_at = time.monotonic()
+            next_decision_log_at = step_started_at
+            while time.monotonic() - step_started_at < step_duration_sec:
+                rclpy.spin_once(monitor.node, timeout_sec=0.0)
+                now = time.monotonic()
+                if now >= next_decision_log_at:
+                    decision = log_passive_corridor_decision(
+                        monitor,
+                        memory,
+                        args,
+                        f"step={step_index + 1}/{step_count} moving",
+                    )
+                    next_decision_log_at = now + decision_log_interval_sec
+                    opening_side = opening_side_for_decision(decision)
+                    if (opening_side is not None or active_candidate is not None) and len(events) < max_inspections:
+                        inspection_started = await update_opening_candidate(opening_side, step_index, "moving")
+                        if inspection_started:
+                            break
+                if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
+                    await send_zero_body_velocity(drone, velocity_type)
+                    return payload
+                await drone.offboard.set_velocity_body(velocity_type(forward_speed, 0.0, 0.0, 0.0))
+                await asyncio.sleep(interval_sec)
+
+            await send_zero_body_velocity(drone, velocity_type)
+            end_position = await read_position_ned(drone, f"after inspection step {step_index + 1}")
+            log_position_delta(f"inspection step {step_index + 1}", end_position, start_position)
+            if pause_sec > 0.0:
+                log(tag, f"pausing for {pause_sec:.1f}s")
+                pause_started_at = time.monotonic()
+                while time.monotonic() - pause_started_at < pause_sec:
+                    rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                    await send_zero_body_velocity(drone, velocity_type)
+                    await asyncio.sleep(0.05)
+    finally:
+        try:
+            await send_zero_body_velocity(drone, velocity_type)
+        except Exception as exc:
+            log("INSPECT", f"body zero velocity before offboard stop failed: {exc}")
+        try:
+            log("INSPECT", "stopping offboard mode")
+            await drone.offboard.stop()
+        except Exception as exc:
+            log("INSPECT", f"offboard stop failed, continuing to land: {exc}")
+
+    write_inspection_events(args.inspection_events_output, payload)
+    log("INSPECT", f"inspection events written: {args.inspection_events_output}")
+    return payload
 
 
 async def stream_zero_hover(
@@ -1902,6 +3004,163 @@ async def run_corridor_follow_check(args: argparse.Namespace) -> int:
         close_scan_monitor(rclpy, monitor)
 
 
+async def run_room_inspection_check(args: argparse.Namespace) -> int:
+    system_type = import_mavsdk_system()
+    velocity_type = import_velocity_body_yawspeed()
+    gas_model = import_gas_model()
+    if system_type is None or velocity_type is None or gas_model is None:
+        return 1
+    compute_ppm, resolve_scenario, possible_gas_zones = gas_model
+
+    monitor_bundle = create_scan_monitor(args)
+    if monitor_bundle is None:
+        return 1
+    rclpy, monitor = monitor_bundle
+
+    rng = random.Random(args.gas_seed)
+    try:
+        scenario, active_sources = resolve_scenario(args.gas_scenario, rng)
+    except Exception as exc:
+        print(f"Could not resolve gas scenario {args.gas_scenario!r}: {exc}")
+        close_scan_monitor(rclpy, monitor)
+        return 2
+
+    drone = system_type()
+    land_requested = False
+    offboard_started = False
+
+    log("CONFIG", "opening-based room inspection check")
+    log("CONFIG", f"system_address={args.system_address}")
+    log("CONFIG", f"takeoff_altitude={args.takeoff_altitude:.1f} m")
+    log("CONFIG", f"min_takeoff_confirm_altitude={args.min_takeoff_confirm_altitude:.2f} m")
+    log("CONFIG", f"corridor_step_count={max(0, args.corridor_step_count)}")
+    log("CONFIG", f"body_forward_speed={args.body_forward_speed:.2f} m/s")
+    log("CONFIG", f"max_inspections={max(0, args.max_inspections)}")
+    log("CONFIG", f"inspection_side_speed={abs(float(args.inspection_side_speed)):.2f} m/s")
+    log("CONFIG", f"inspection_events_output={args.inspection_events_output}")
+    log("GAS", f"gas_scenario={args.gas_scenario}, resolved={scenario}, gas_seed={args.gas_seed}")
+
+    try:
+        scan_ready = await wait_for_scan_readiness(rclpy, monitor, args)
+        if not scan_ready:
+            log("FINISH", "aborting before MAVSDK connect because scan readiness failed")
+            return 1
+
+        log("CONNECT", f"connecting to MAVSDK system at {args.system_address}")
+        await asyncio.wait_for(drone.connect(system_address=args.system_address), timeout=args.connection_timeout)
+        await wait_for_mavsdk_connection(drone, args.connection_timeout)
+        await wait_for_mavsdk_health(drone, args.connection_timeout)
+
+        log("TAKEOFF", f"setting takeoff altitude to {args.takeoff_altitude:.1f} m")
+        await drone.action.set_takeoff_altitude(max(0.1, args.takeoff_altitude))
+        log("TAKEOFF", "arming")
+        await drone.action.arm()
+        log("TAKEOFF", "takeoff command sent")
+        await drone.action.takeoff()
+
+        altitude_result = await wait_until_takeoff_altitude(
+            drone,
+            target_altitude_m=args.takeoff_altitude,
+            timeout_sec=args.takeoff_timeout,
+            tolerance_m=args.takeoff_altitude_tolerance,
+            min_confirm_altitude_m=args.min_takeoff_confirm_altitude,
+        )
+        should_inspect = altitude_result.confirmed or altitude_result.safe_hover_altitude
+        if altitude_result.confirmed:
+            log("TAKEOFF", f"takeoff altitude confirmed at {altitude_result.last_altitude_m:.2f} m")
+        elif altitude_result.safe_hover_altitude:
+            log(
+                "TAKEOFF",
+                "target altitude was not fully confirmed, "
+                f"but safe hover altitude was reached at {altitude_result.last_altitude_m:.2f} m",
+            )
+        else:
+            log(
+                "TAKEOFF",
+                "takeoff altitude was not confirmed and safe hover altitude was not reached; "
+                f"last_altitude={altitude_result.last_altitude_m:.2f} m",
+            )
+
+        if should_inspect:
+            settle_seconds = max(0.0, args.post_takeoff_settle_seconds)
+            if settle_seconds > 0.0:
+                log("TAKEOFF", f"settling after takeoff for {settle_seconds:.1f}s")
+                settle_started_at = time.monotonic()
+                while time.monotonic() - settle_started_at < settle_seconds:
+                    rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                    await asyncio.sleep(0.05)
+
+            yaw_deg = await read_initial_yaw_deg(drone)
+            log("INSPECT", f"front safety is aligned with body forward direction; initial_yaw={yaw_deg:.1f} deg")
+            offboard_started = True
+            await run_room_inspection_steps(
+                drone,
+                rclpy,
+                monitor,
+                args,
+                velocity_type,
+                compute_ppm,
+                active_sources,
+                scenario,
+                possible_gas_zones,
+            )
+            offboard_started = False
+        else:
+            log("INSPECT", "skipping room inspection and landing")
+
+        pre_land_settle_seconds = max(0.0, args.pre_land_settle_seconds)
+        if pre_land_settle_seconds > 0.0:
+            log("LAND", f"settling before land for {pre_land_settle_seconds:.1f}s")
+            settle_started_at = time.monotonic()
+            while time.monotonic() - settle_started_at < pre_land_settle_seconds:
+                rclpy.spin_once(monitor.node, timeout_sec=0.02)
+                await asyncio.sleep(0.05)
+
+        land_requested = True
+        log("LAND", "land command sent")
+        await drone.action.land()
+        log("FINISH", "room inspection check complete")
+        return 0
+    except asyncio.TimeoutError:
+        log("FINISH", "timed out while waiting for PX4 connection or vehicle health")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("INSPECT", f"offboard stop during timeout cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 1
+    except KeyboardInterrupt:
+        log("FINISH", "interrupted by user")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("INSPECT", f"offboard stop during interrupt cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 130
+    except Exception as exc:
+        if land_requested:
+            if is_grpc_disconnect_error(exc):
+                log("LAND", f"connection closed after land command; exiting calmly: {exc}")
+                return 0
+            log("LAND", f"land command was already sent; not retrying safety land: {exc}")
+            return 1
+
+        log("FINISH", f"room inspection failed before land command: {exc}")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as stop_exc:
+                log("INSPECT", f"offboard stop during error cleanup failed: {stop_exc}")
+        await try_safety_land(drone)
+        return 1
+    finally:
+        close_scan_monitor(rclpy, monitor)
+
+
 async def run_axis_calibration_check(args: argparse.Namespace) -> int:
     system_type = import_mavsdk_system()
     ned_velocity_type = import_velocity_ned_yaw()
@@ -2144,6 +3403,8 @@ def main() -> int:
         return asyncio.run(run_takeoff_land_check(args))
     if args.corridor_follow_check:
         return asyncio.run(run_corridor_follow_check(args))
+    if args.room_inspection_check:
+        return asyncio.run(run_room_inspection_check(args))
     if args.axis_calibration_check:
         return asyncio.run(run_axis_calibration_check(args))
     if not args.dry_run:
@@ -2151,6 +3412,7 @@ def main() -> int:
             "Use --dry-run for pure Python simulation, --scan-monitor for ROS2 LaserScan monitoring, "
             "--takeoff-land-check for MAVSDK takeoff/land validation, "
             "--corridor-follow-check for low-speed front-safe corridor movement, "
+            "--room-inspection-check for opening inspection with simulated gas candidate logging, "
             "or --axis-calibration-check for offboard axis diagnosis."
         )
         return 2
