@@ -128,6 +128,20 @@ class OpeningCandidateState:
 
 
 @dataclass(frozen=True)
+class PositionOpeningAnchor:
+    side: str
+    start_step: int
+    mature_step: int
+    anchor_north: float
+    anchor_east: float
+    start_position: object | None
+    mature_position: object | None
+    best_position: object | None
+    best_side_avg: float
+    frames_seen: int
+
+
+@dataclass(frozen=True)
 class TakeoffAltitudeResult:
     confirmed: bool
     safe_hover_altitude: bool
@@ -191,6 +205,16 @@ def parse_args() -> argparse.Namespace:
         "--room-inspection-check",
         action="store_true",
         help="Run corridor-follow with short opening inspections and simulated gas candidate event logging.",
+    )
+    parser.add_argument(
+        "--position-room-inspection-check",
+        action="store_true",
+        help="Run a position-setpoint corridor and room inspection check using MAVSDK PositionNedYaw.",
+    )
+    parser.add_argument(
+        "--position-side-sign-check",
+        action="store_true",
+        help="Run a small PositionNedYaw left/right sign diagnostic without room inspection.",
     )
     parser.add_argument(
         "--axis-calibration-check",
@@ -302,6 +326,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--axis-calibration-duration", type=float, default=1.5)
     parser.add_argument("--offboard-zero-hover-seconds", type=float, default=2.0)
     parser.add_argument("--offboard-warmup-seconds", type=float, default=1.5)
+    parser.add_argument("--position-step-count", type=int, default=6)
+    parser.add_argument("--position-forward-step", type=float, default=0.6)
+    parser.add_argument("--position-hold-seconds", type=float, default=2.5)
+    parser.add_argument("--position-altitude", type=float, default=1.2)
+    parser.add_argument("--position-yaw", type=float, default=90.0)
+    parser.add_argument("--position-room-entry-distance", type=float, default=1.5)
+    parser.add_argument("--position-room-entry-hold-seconds", type=float, default=2.5)
     parser.add_argument("--return-home", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -960,6 +991,16 @@ def import_velocity_body_yawspeed() -> object | None:
     return VelocityBodyYawspeed
 
 
+def import_position_ned_yaw() -> object | None:
+    try:
+        from mavsdk.offboard import PositionNedYaw
+    except Exception as exc:
+        print(f"Could not import MAVSDK position setpoint type: {exc}")
+        print("Make sure MAVSDK-Python offboard support is available before using --position-room-inspection-check.")
+        return None
+    return PositionNedYaw
+
+
 def import_gas_model() -> tuple[object, object, object] | None:
     try:
         from demo_tools.gas_sensor_node import POSSIBLE_GAS_ZONES, compute_ppm, resolve_scenario
@@ -1546,6 +1587,122 @@ def opening_side_for_decision(decision: Decision) -> str | None:
     if decision == Decision.DETECT_RIGHT_OPENING:
         return "right"
     return None
+
+
+async def goto_position_ned(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    position_type: object,
+    north_m: float,
+    east_m: float,
+    down_m: float,
+    yaw_deg: float,
+    hold_sec: float,
+    label: str,
+) -> None:
+    hold_sec = max(0.0, hold_sec)
+    log(
+        "POS",
+        f"{label}: N={north_m:.2f}, E={east_m:.2f}, D={down_m:.2f}, yaw={yaw_deg:.1f}, hold={hold_sec:.1f}s",
+    )
+    await drone.offboard.set_position_ned(position_type(north_m, east_m, down_m, yaw_deg))
+    started_at = time.monotonic()
+    while time.monotonic() - started_at < hold_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.02)
+        await asyncio.sleep(0.05)
+
+
+async def sample_gas_at_position(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    position_type: object,
+    args: argparse.Namespace,
+    label: str,
+    duration_sec: float,
+    hold_north_m: float,
+    hold_east_m: float,
+    hold_down_m: float,
+    yaw_deg: float,
+    compute_ppm: object,
+    active_sources: list[dict[str, Any]],
+    rng: random.Random,
+) -> GasSampleSummary:
+    duration_sec = max(0.0, duration_sec)
+    rate_hz = max(0.1, args.gas_sample_rate_hz)
+    interval_sec = 1.0 / rate_hz
+    samples: list[float] = []
+    last_position: object | None = None
+    started_at = time.monotonic()
+    log("GAS", f"{label} position-hold sampling for {duration_sec:.1f}s at {rate_hz:.1f} Hz")
+
+    while time.monotonic() - started_at < duration_sec:
+        rclpy.spin_once(monitor.node, timeout_sec=0.0)
+        await drone.offboard.set_position_ned(position_type(hold_north_m, hold_east_m, hold_down_m, yaw_deg))
+        position = await read_position_ned_quiet(drone)
+        if position is not None:
+            last_position = position
+            ppm, _nearest_distance = compute_ppm(
+                x=float(position.north_m),
+                y=float(position.east_m),
+                active_sources=active_sources,
+                background_ppm=args.background_ppm,
+                peak_ppm=args.peak_ppm,
+                sigma=args.sigma,
+                rng=rng,
+                noise_std=args.noise_std,
+            )
+            samples.append(float(ppm))
+            log("GAS", f"{label} sample ppm={ppm:.2f}")
+        await asyncio.sleep(interval_sec)
+
+    avg_ppm = sum(samples) / len(samples) if samples else 0.0
+    max_ppm = max(samples) if samples else 0.0
+    log("GAS", f"{label}_avg={avg_ppm:.2f} ppm, max={max_ppm:.2f} ppm, samples={len(samples)}")
+    return GasSampleSummary(
+        label=label,
+        sample_count=len(samples),
+        avg_ppm=avg_ppm,
+        max_ppm=max_ppm,
+        position=position_as_event_dict(last_position),
+    )
+
+
+async def soft_land_position_mode(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    position_type: object,
+    north_m: float,
+    east_m: float,
+    yaw_deg: float,
+) -> None:
+    for altitude_m in (1.0, 0.7, 0.4):
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            north_m,
+            east_m,
+            -altitude_m,
+            yaw_deg,
+            3.0,
+            f"soft land descent {altitude_m:.1f}m",
+        )
+
+
+def log_position_decision_scan(monitor: LaserScanMonitor, args: argparse.Namespace, context: str) -> None:
+    scan = monitor.decision_snapshot()
+    log(
+        "SCAN",
+        f"{context} decision "
+        f"left_min={format_distance(scan.left_min)} left_avg={format_distance(scan.left_avg)} "
+        f"right_min={format_distance(scan.right_min)} right_avg={format_distance(scan.right_avg)} "
+        f"valid(left/right)={scan.left_valid_count}/{scan.right_valid_count} "
+        f"ratio(left/right)={scan.left_valid_ratio:.2f}/{scan.right_valid_ratio:.2f}",
+    )
 
 
 async def send_zero_velocity(drone: object, velocity_type: object, yaw_deg: float) -> None:
@@ -3253,6 +3410,578 @@ async def run_room_inspection_check(args: argparse.Namespace) -> int:
         close_scan_monitor(rclpy, monitor)
 
 
+async def run_position_room_inspection_steps(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    position_type: object,
+    compute_ppm: object,
+    active_sources: list[dict[str, Any]],
+    scenario: str,
+    possible_gas_zones: dict[str, tuple[float, float]],
+) -> dict[str, Any]:
+    step_count = max(0, args.position_step_count)
+    forward_step = max(0.0, args.position_forward_step)
+    hold_sec = max(0.0, args.position_hold_seconds)
+    down_m = -max(0.1, args.position_altitude)
+    yaw_deg = float(args.position_yaw)
+    room_entry_distance = max(0.0, args.position_room_entry_distance)
+    room_entry_hold_sec = max(0.0, args.position_room_entry_hold_seconds)
+    max_inspections = max(0, args.max_inspections)
+    rng = random.Random(args.gas_seed)
+    memory = MissionMemory(
+        visited_openings=set(),
+        skipped_openings=set(),
+        bypass_attempts=0,
+        corridor_x=0.0,
+        seed=args.seed if args.seed is not None else 0,
+    )
+    current_north = 0.0
+    current_east = 0.0
+    active_candidate: OpeningCandidateState | None = None
+    events: list[dict[str, Any]] = []
+    payload: dict[str, Any] = {
+        "requested_scenario": args.gas_scenario,
+        "scenario": scenario,
+        "gas_seed": args.gas_seed,
+        "active_sources": active_sources,
+        "possible_gas_zones": {name: {"x": xy[0], "y": xy[1]} for name, xy in possible_gas_zones.items()},
+        "events": events,
+    }
+
+    log("POS", "position room inspection uses PositionNedYaw setpoint steps")
+    log("POS", f"step_count={step_count}")
+    log("POS", f"forward_step={forward_step:.2f} m")
+    log("POS", f"hold_seconds={hold_sec:.1f}")
+    log("POS", f"altitude={-down_m:.2f} m")
+    log("POS", f"yaw={yaw_deg:.1f} deg")
+    log("POS", f"room_entry_distance={room_entry_distance:.2f} m")
+    log("POS", f"max_inspections={max_inspections}")
+
+    def reject_candidate(reason: str) -> None:
+        nonlocal active_candidate
+        if active_candidate is None:
+            return
+        log(
+            "OPENING",
+            f"position candidate rejected reason={reason} side={active_candidate.active_side} "
+            f"frames={active_candidate.frames_seen} best={active_candidate.best_side_avg:.2f}",
+        )
+        active_candidate = None
+
+    async def update_candidate(step_index: int, phase: str) -> PositionOpeningAnchor | None:
+        nonlocal active_candidate
+        scan = monitor.decision_snapshot()
+        decision = decide_corridor_action(scan, memory, args)
+        log_scan_monitor_snapshot(scan)
+        log("DECIDE", f"position step={step_index + 1}/{step_count} {phase} corridor_action={decision.value}")
+        opening_side = opening_side_for_decision(decision)
+        side_to_track = opening_side or (active_candidate.active_side if active_candidate is not None else None)
+        if side_to_track is None:
+            return None
+
+        is_open, reason, metrics = side_decision_diagnostics(scan, side_to_track, args)
+        if not is_open:
+            reject_candidate("lost_opening")
+            return None
+
+        front_clear, front_distance = front_clearance_for_candidate(monitor, args)
+        if args.opening_require_front_clear and not front_clear:
+            reject_candidate("front_not_clear")
+            return None
+
+        current_position = await read_position_ned_quiet(drone)
+        side_avg = side_avg_for_snapshot(scan, side_to_track)
+        side_min = side_min_for_snapshot(scan, side_to_track)
+        if active_candidate is None or active_candidate.active_side != side_to_track:
+            if active_candidate is not None:
+                reject_candidate("side_changed")
+            active_candidate = OpeningCandidateState(
+                active_side=side_to_track,
+                start_step=step_index,
+                start_position=current_position,
+                best_position=current_position,
+                best_side_avg=side_avg,
+                frames_seen=1,
+                last_seen_step=step_index,
+                best_front_distance=front_distance,
+            )
+            log(
+                "OPENING",
+                f"position candidate started side={side_to_track} step={step_index + 1} "
+                f"phase={phase} side_avg={side_avg:.2f} side_min={side_min:.2f} reason={reason}",
+            )
+            return None
+
+        active_candidate.frames_seen += 1
+        active_candidate.last_seen_step = step_index
+        if side_avg > active_candidate.best_side_avg:
+            active_candidate.best_side_avg = side_avg
+            active_candidate.best_position = current_position
+            active_candidate.best_front_distance = front_distance
+
+        progress = horizontal_distance(current_position, active_candidate.start_position)
+        progress_text = "unknown" if progress is None else f"{progress:.2f}"
+        front_text = "unknown" if front_distance is None else f"{front_distance:.2f}"
+        log(
+            "OPENING",
+            f"position candidate update side={side_to_track} phase={phase} side_avg={side_avg:.2f} "
+            f"side_min={side_min:.2f} best={active_candidate.best_side_avg:.2f} "
+            f"frames={active_candidate.frames_seen} progress={progress_text} front={front_text}",
+        )
+
+        min_frames = max(1, args.opening_min_persistence_frames)
+        min_progress = max(0.0, args.opening_min_forward_progress)
+        peak_drop = max(0.0, args.opening_peak_drop_distance)
+        if active_candidate.frames_seen < min_frames:
+            return None
+        if progress is None or progress < min_progress:
+            return None
+        if side_avg < active_candidate.best_side_avg - peak_drop:
+            reject_candidate("lost_peak")
+            return None
+
+        candidate = active_candidate
+        side_for_inspection = candidate.active_side
+        anchor_east = (
+            float(candidate.start_position.east_m)
+            if candidate.start_position is not None
+            else current_east
+        )
+        anchor = PositionOpeningAnchor(
+            side=side_for_inspection,
+            start_step=candidate.start_step,
+            mature_step=step_index,
+            anchor_north=current_north,
+            anchor_east=anchor_east,
+            start_position=candidate.start_position,
+            mature_position=current_position,
+            best_position=candidate.best_position,
+            best_side_avg=candidate.best_side_avg,
+            frames_seen=candidate.frames_seen,
+        )
+        log(
+            "OPENING",
+            f"position candidate mature/confirmed side={side_for_inspection} "
+            f"frames={candidate.frames_seen} progress={progress_text} best={candidate.best_side_avg:.2f} "
+            f"anchor_east={anchor_east:.2f}",
+        )
+        active_candidate = None
+        return anchor
+
+    async def inspect_position_opening(anchor: PositionOpeningAnchor) -> None:
+        nonlocal current_north, current_east
+        if len(events) >= max_inspections:
+            return
+
+        side = anchor.side
+        anchor_north = anchor.anchor_north
+        anchor_east = anchor.anchor_east
+        log(
+            "POS",
+            f"aligning to {side} candidate anchor before entry: "
+            f"N={anchor_north:.2f}, E={anchor_east:.2f}, start_step={anchor.start_step + 1}, mature_step={anchor.mature_step + 1}",
+        )
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            anchor_north,
+            anchor_east,
+            down_m,
+            yaw_deg,
+            hold_sec,
+            f"align {side} opening anchor",
+        )
+        current_north = anchor_north
+        current_east = anchor_east
+        opening_id = f"{side}@north={anchor_north:.1f},east={anchor_east:.1f}"
+        baseline = await sample_gas_at_position(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            args,
+            "baseline",
+            args.baseline_sample_seconds,
+            anchor_north,
+            anchor_east,
+            down_m,
+            yaw_deg,
+            compute_ppm,
+            active_sources,
+            rng,
+        )
+
+        entry_north = anchor_north + room_entry_distance if side == "left" else anchor_north - room_entry_distance
+        log("POS", f"entering {side} room by position step: target_north={entry_north:.2f}, east={anchor_east:.2f}")
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            entry_north,
+            anchor_east,
+            down_m,
+            yaw_deg,
+            room_entry_hold_sec,
+            f"enter {side} opening",
+        )
+        current_north = entry_north
+        current_east = anchor_east
+
+        inspection = await sample_gas_at_position(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            args,
+            "inspection",
+            args.inspection_sample_seconds,
+            current_north,
+            current_east,
+            down_m,
+            yaw_deg,
+            compute_ppm,
+            active_sources,
+            rng,
+        )
+        delta_ppm = inspection.avg_ppm - baseline.avg_ppm
+        candidate_by_delta = delta_ppm >= max(0.0, args.gas_delta_threshold)
+        candidate_by_absolute = inspection.avg_ppm >= max(0.0, args.gas_absolute_threshold)
+        gas_candidate = candidate_by_delta or candidate_by_absolute
+        reason = "delta_ppm" if candidate_by_delta else "absolute_ppm" if candidate_by_absolute else "below_threshold"
+        log(
+            "GAS",
+            "position gas candidate decision: "
+            f"side={side}, baseline={baseline.avg_ppm:.2f}, inspection={inspection.avg_ppm:.2f}, "
+            f"delta={delta_ppm:.2f}, candidate={gas_candidate}, reason={reason}",
+        )
+
+        event = {
+            "inspection_index": len(events) + 1,
+            "side": side,
+            "opening_id": opening_id,
+            "step_index": anchor.mature_step + 1,
+            "candidate_start_step": anchor.start_step + 1,
+            "candidate_mature_step": anchor.mature_step + 1,
+            "baseline_avg_ppm": round(baseline.avg_ppm, 3),
+            "inspection_avg_ppm": round(inspection.avg_ppm, 3),
+            "delta_ppm": round(delta_ppm, 3),
+            "gas_candidate": gas_candidate,
+            "candidate_reason": reason,
+            "baseline_sample_count": baseline.sample_count,
+            "inspection_sample_count": inspection.sample_count,
+            "baseline_position": baseline.position,
+            "inspection_position": inspection.position,
+            "entry_anchor_position": {"north": round(anchor_north, 3), "east": round(anchor_east, 3), "altitude": -down_m},
+            "entry_anchor_source": "candidate_start",
+            "candidate_start_position": position_as_event_dict(anchor.start_position),
+            "candidate_mature_position": position_as_event_dict(anchor.mature_position),
+            "candidate_best_position": position_as_event_dict(anchor.best_position),
+            "candidate_best_side_avg": round(anchor.best_side_avg, 3),
+            "candidate_frames_seen": anchor.frames_seen,
+            "enter_target_distance_m": round(room_entry_distance, 3),
+            "enter_actual_distance_m": round(abs(entry_north - anchor_north), 3),
+            "exit_final_distance_m": None,
+        }
+        events.append(event)
+        write_inspection_events(args.inspection_events_output, payload)
+
+        log("POS", f"exiting {side} room back to corridor anchor")
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            anchor_north,
+            anchor_east,
+            down_m,
+            yaw_deg,
+            max(2.0, room_entry_hold_sec),
+            f"exit {side} opening",
+        )
+        current_north = anchor_north
+        current_east = anchor_east
+        event["exit_final_distance_m"] = 0.0
+        write_inspection_events(args.inspection_events_output, payload)
+
+    await goto_position_ned(drone, rclpy, monitor, position_type, current_north, current_east, down_m, yaw_deg, 5.0, "initial hover")
+    for step_index in range(step_count):
+        rclpy.spin_once(monitor.node, timeout_sec=0.05)
+        if front_motion_status(monitor, args) == "blocked":
+            log("SAFETY", "position mode front blocked before next corridor step")
+            break
+
+        current_east += forward_step
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            current_north,
+            current_east,
+            down_m,
+            yaw_deg,
+            hold_sec,
+            f"corridor step {step_index + 1}/{step_count}",
+        )
+        anchor = await update_candidate(step_index, "post-step")
+        if anchor is not None and len(events) < max_inspections:
+            await inspect_position_opening(anchor)
+        if len(events) >= max_inspections:
+            log("POS", "max inspections reached; remaining steps only follow position corridor")
+
+    write_inspection_events(args.inspection_events_output, payload)
+    log("POS", f"position inspection events written: {args.inspection_events_output}")
+    return payload
+
+
+async def run_position_room_inspection_check(args: argparse.Namespace) -> int:
+    system_type = import_mavsdk_system()
+    position_type = import_position_ned_yaw()
+    gas_model = import_gas_model()
+    if system_type is None or position_type is None or gas_model is None:
+        return 1
+    compute_ppm, resolve_scenario, possible_gas_zones = gas_model
+
+    monitor_bundle = create_scan_monitor(args)
+    if monitor_bundle is None:
+        return 1
+    rclpy, monitor = monitor_bundle
+
+    rng = random.Random(args.gas_seed)
+    try:
+        scenario, active_sources = resolve_scenario(args.gas_scenario, rng)
+    except Exception as exc:
+        print(f"Could not resolve gas scenario {args.gas_scenario!r}: {exc}")
+        close_scan_monitor(rclpy, monitor)
+        return 2
+
+    drone = system_type()
+    land_requested = False
+    offboard_started = False
+    current_north = 0.0
+    current_east = 0.0
+    down_m = -max(0.1, args.position_altitude)
+    yaw_deg = float(args.position_yaw)
+
+    log("CONFIG", "opening-based position room inspection check")
+    log("CONFIG", f"system_address={args.system_address}")
+    log("CONFIG", f"position_step_count={max(0, args.position_step_count)}")
+    log("CONFIG", f"position_forward_step={max(0.0, args.position_forward_step):.2f} m")
+    log("CONFIG", f"position_altitude={-down_m:.2f} m")
+    log("CONFIG", f"position_yaw={yaw_deg:.1f} deg")
+    log("CONFIG", f"position_room_entry_distance={max(0.0, args.position_room_entry_distance):.2f} m")
+    log("GAS", f"gas_scenario={args.gas_scenario}, resolved={scenario}, gas_seed={args.gas_seed}")
+
+    try:
+        scan_ready = await wait_for_scan_readiness(rclpy, monitor, args)
+        if not scan_ready:
+            log("FINISH", "aborting before MAVSDK connect because scan readiness failed")
+            return 1
+
+        log("CONNECT", f"connecting to MAVSDK system at {args.system_address}")
+        await asyncio.wait_for(drone.connect(system_address=args.system_address), timeout=args.connection_timeout)
+        await wait_for_mavsdk_connection(drone, args.connection_timeout)
+        await wait_for_mavsdk_health(drone, args.connection_timeout)
+
+        log("POS", "sending initial position setpoint before arming")
+        await drone.offboard.set_position_ned(position_type(current_north, current_east, down_m, yaw_deg))
+        log("TAKEOFF", "arming")
+        await drone.action.arm()
+        log("POS", "starting offboard position mode")
+        await drone.offboard.start()
+        offboard_started = True
+
+        await run_position_room_inspection_steps(
+            drone,
+            rclpy,
+            monitor,
+            args,
+            position_type,
+            compute_ppm,
+            active_sources,
+            scenario,
+            possible_gas_zones,
+        )
+        final_position = await read_position_ned_quiet(drone)
+        if final_position is not None:
+            current_north = float(final_position.north_m)
+            current_east = float(final_position.east_m)
+        await soft_land_position_mode(drone, rclpy, monitor, position_type, current_north, current_east, yaw_deg)
+        log("POS", "stopping offboard mode")
+        await drone.offboard.stop()
+        offboard_started = False
+        land_requested = True
+        log("LAND", "land command sent")
+        await drone.action.land()
+        log("FINISH", "position room inspection check complete")
+        return 0
+    except asyncio.TimeoutError:
+        log("FINISH", "timed out while waiting for PX4 connection or vehicle health")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("POS", f"offboard stop during timeout cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 1
+    except KeyboardInterrupt:
+        log("FINISH", "interrupted by user")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("POS", f"offboard stop during interrupt cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 130
+    except Exception as exc:
+        log("FINISH", f"position room inspection failed before land command: {exc}")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as stop_exc:
+                log("POS", f"offboard stop during error cleanup failed: {stop_exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 1
+    finally:
+        close_scan_monitor(rclpy, monitor)
+
+
+async def run_position_side_sign_check(args: argparse.Namespace) -> int:
+    system_type = import_mavsdk_system()
+    position_type = import_position_ned_yaw()
+    if system_type is None or position_type is None:
+        return 1
+
+    monitor_bundle = create_scan_monitor(args)
+    if monitor_bundle is None:
+        return 1
+    rclpy, monitor = monitor_bundle
+
+    drone = system_type()
+    land_requested = False
+    offboard_started = False
+    center_north = 0.0
+    center_east = 0.0
+    down_m = -max(0.1, args.position_altitude)
+    yaw_deg = float(args.position_yaw)
+    lateral_distance = max(0.0, args.position_room_entry_distance)
+    hold_sec = max(0.0, args.position_room_entry_hold_seconds)
+
+    log("CONFIG", "position side sign diagnostic check")
+    log("CONFIG", f"system_address={args.system_address}")
+    log("CONFIG", f"position_altitude={-down_m:.2f} m")
+    log("CONFIG", f"position_yaw={yaw_deg:.1f} deg")
+    log("CONFIG", f"lateral_test_distance={lateral_distance:.2f} m")
+    log("CONFIG", f"hold_seconds={hold_sec:.1f}")
+
+    try:
+        scan_ready = await wait_for_scan_readiness(rclpy, monitor, args)
+        if not scan_ready:
+            log("FINISH", "aborting before MAVSDK connect because scan readiness failed")
+            return 1
+
+        log("CONNECT", f"connecting to MAVSDK system at {args.system_address}")
+        await asyncio.wait_for(drone.connect(system_address=args.system_address), timeout=args.connection_timeout)
+        await wait_for_mavsdk_connection(drone, args.connection_timeout)
+        await wait_for_mavsdk_health(drone, args.connection_timeout)
+
+        log("POS", "sending initial position setpoint before arming")
+        await drone.offboard.set_position_ned(position_type(center_north, center_east, down_m, yaw_deg))
+        log("TAKEOFF", "arming")
+        await drone.action.arm()
+        log("POS", "starting offboard position mode")
+        await drone.offboard.start()
+        offboard_started = True
+
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            center_north,
+            center_east,
+            down_m,
+            yaw_deg,
+            4.0,
+            "center hover",
+        )
+        log_position_decision_scan(monitor, args, "center hover")
+
+        test_points = (
+            ("test_left", center_north + lateral_distance, center_east),
+            ("return_center_after_left", center_north, center_east),
+            ("test_right", center_north - lateral_distance, center_east),
+            ("return_center_after_right", center_north, center_east),
+        )
+        for label, target_north, target_east in test_points:
+            await goto_position_ned(
+                drone,
+                rclpy,
+                monitor,
+                position_type,
+                target_north,
+                target_east,
+                down_m,
+                yaw_deg,
+                hold_sec,
+                label,
+            )
+            log_position_decision_scan(monitor, args, label)
+
+        final_position = await read_position_ned_quiet(drone)
+        land_north = center_north if final_position is None else float(final_position.north_m)
+        land_east = center_east if final_position is None else float(final_position.east_m)
+        await soft_land_position_mode(drone, rclpy, monitor, position_type, land_north, land_east, yaw_deg)
+        log("POS", "stopping offboard mode")
+        await drone.offboard.stop()
+        offboard_started = False
+        land_requested = True
+        log("LAND", "land command sent")
+        await drone.action.land()
+        log("FINISH", "position side sign diagnostic complete")
+        return 0
+    except asyncio.TimeoutError:
+        log("FINISH", "timed out while waiting for PX4 connection or vehicle health")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("POS", f"offboard stop during timeout cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 1
+    except KeyboardInterrupt:
+        log("FINISH", "interrupted by user")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as exc:
+                log("POS", f"offboard stop during interrupt cleanup failed: {exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 130
+    except Exception as exc:
+        log("FINISH", f"position side sign diagnostic failed before land command: {exc}")
+        if offboard_started:
+            try:
+                await drone.offboard.stop()
+            except Exception as stop_exc:
+                log("POS", f"offboard stop during error cleanup failed: {stop_exc}")
+        if not land_requested:
+            await try_safety_land(drone)
+        return 1
+    finally:
+        close_scan_monitor(rclpy, monitor)
+
+
 async def run_axis_calibration_check(args: argparse.Namespace) -> int:
     system_type = import_mavsdk_system()
     ned_velocity_type = import_velocity_ned_yaw()
@@ -3497,6 +4226,10 @@ def main() -> int:
         return asyncio.run(run_corridor_follow_check(args))
     if args.room_inspection_check:
         return asyncio.run(run_room_inspection_check(args))
+    if args.position_room_inspection_check:
+        return asyncio.run(run_position_room_inspection_check(args))
+    if args.position_side_sign_check:
+        return asyncio.run(run_position_side_sign_check(args))
     if args.axis_calibration_check:
         return asyncio.run(run_axis_calibration_check(args))
     if not args.dry_run:
@@ -3505,6 +4238,8 @@ def main() -> int:
             "--takeoff-land-check for MAVSDK takeoff/land validation, "
             "--corridor-follow-check for low-speed front-safe corridor movement, "
             "--room-inspection-check for opening inspection with simulated gas candidate logging, "
+            "--position-room-inspection-check for position-setpoint opening inspection, "
+            "--position-side-sign-check for position left/right sign diagnosis, "
             "or --axis-calibration-check for offboard axis diagnosis."
         )
         return 2
