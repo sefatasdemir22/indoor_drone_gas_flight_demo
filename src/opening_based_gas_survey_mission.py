@@ -249,6 +249,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--body-right-speed", type=float, default=0.0)
     parser.add_argument("--body-down-speed", type=float, default=0.0)
     parser.add_argument("--body-yawspeed", type=float, default=0.0)
+    parser.add_argument("--enable-corridor-centering", action="store_true")
+    parser.add_argument("--corridor-center-kp", type=float, default=0.08)
+    parser.add_argument("--corridor-center-max-right-speed", type=float, default=0.08)
+    parser.add_argument("--corridor-center-deadband", type=float, default=0.15)
+    parser.add_argument("--enable-altitude-hold", action="store_true")
+    parser.add_argument("--target-altitude", type=float, default=1.0)
+    parser.add_argument("--altitude-hold-kp", type=float, default=0.25)
+    parser.add_argument("--altitude-hold-max-down-speed", type=float, default=0.15)
     parser.add_argument(
         "--enable-opening-probe",
         action="store_true",
@@ -1210,6 +1218,76 @@ def horizontal_distance(position: object | None, anchor_position: object | None)
     return horizontal_magnitude(delta_north, delta_east)
 
 
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def compute_corridor_centering_command(monitor: LaserScanMonitor, args: argparse.Namespace) -> float:
+    if not args.enable_corridor_centering:
+        return 0.0
+
+    scan = monitor.decision_snapshot()
+    min_valid_samples = max(1, args.min_valid_samples)
+    min_valid_ratio = max(0.0, min(1.0, args.min_valid_ratio))
+    if (
+        not scan.left_ready
+        or not scan.right_ready
+        or scan.left_valid_count < min_valid_samples
+        or scan.right_valid_count < min_valid_samples
+        or scan.left_valid_ratio < min_valid_ratio
+        or scan.right_valid_ratio < min_valid_ratio
+    ):
+        log(
+            "CENTER",
+            "side scan unavailable; right_cmd=0.00",
+        )
+        return 0.0
+
+    error = scan.left_avg - scan.right_avg
+    deadband = max(0.0, args.corridor_center_deadband)
+    if abs(error) < deadband:
+        right_cmd = 0.0
+    else:
+        max_right_speed = max(0.0, args.corridor_center_max_right_speed)
+        right_cmd = clamp(
+            -max(0.0, args.corridor_center_kp) * error,
+            -max_right_speed,
+            max_right_speed,
+        )
+
+    log(
+        "CENTER",
+        f"left_avg={scan.left_avg:.2f} right_avg={scan.right_avg:.2f} "
+        f"error={error:.2f} right_cmd={right_cmd:.2f}",
+    )
+    return right_cmd
+
+
+async def compute_altitude_hold_command(drone: object, args: argparse.Namespace) -> float:
+    if not args.enable_altitude_hold:
+        return 0.0
+
+    position = await read_position_ned_quiet(drone)
+    if position is None:
+        log("ALT", "altitude unavailable; down_cmd=0.00")
+        return 0.0
+
+    altitude = max(0.0, -float(position.down_m))
+    target_altitude = max(0.0, args.target_altitude)
+    altitude_error = target_altitude - altitude
+    max_down_speed = max(0.0, args.altitude_hold_max_down_speed)
+    down_cmd = clamp(
+        -max(0.0, args.altitude_hold_kp) * altitude_error,
+        -max_down_speed,
+        max_down_speed,
+    )
+    log(
+        "ALT",
+        f"altitude={altitude:.2f} target={target_altitude:.2f} down_cmd={down_cmd:.2f}",
+    )
+    return down_cmd
+
+
 def position_as_event_dict(position: object | None) -> dict[str, float] | None:
     if position is None:
         return None
@@ -2032,8 +2110,14 @@ async def run_body_corridor_follow_steps(
                 if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
                     await send_zero_body_velocity(drone, velocity_type)
                     return
+                command_right_speed = right_speed + compute_corridor_centering_command(monitor, args)
+                command_down_speed = (
+                    await compute_altitude_hold_command(drone, args)
+                    if args.enable_altitude_hold
+                    else down_speed
+                )
                 await drone.offboard.set_velocity_body(
-                    velocity_type(forward_speed, right_speed, down_speed, yawspeed)
+                    velocity_type(forward_speed, command_right_speed, command_down_speed, yawspeed)
                 )
                 await asyncio.sleep(interval_sec)
 
@@ -2442,7 +2526,15 @@ async def run_room_inspection_steps(
                 if not await front_motion_allowed_with_retry(drone, rclpy, monitor, args, velocity_type):
                     await send_zero_body_velocity(drone, velocity_type)
                     return payload
-                await drone.offboard.set_velocity_body(velocity_type(forward_speed, 0.0, 0.0, 0.0))
+                command_right_speed = compute_corridor_centering_command(monitor, args)
+                command_down_speed = (
+                    await compute_altitude_hold_command(drone, args)
+                    if args.enable_altitude_hold
+                    else 0.0
+                )
+                await drone.offboard.set_velocity_body(
+                    velocity_type(forward_speed, command_right_speed, command_down_speed, 0.0)
+                )
                 await asyncio.sleep(interval_sec)
 
             await send_zero_body_velocity(drone, velocity_type)
