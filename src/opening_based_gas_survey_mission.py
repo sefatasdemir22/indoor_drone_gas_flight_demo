@@ -263,6 +263,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--room-facing-post-yaw-forward-offset-step", type=float, default=0.10)
     parser.add_argument("--room-facing-post-yaw-max-forward-offset", type=float, default=0.30)
     parser.add_argument("--room-facing-post-yaw-min-front-clearance", type=float, default=2.0)
+    parser.add_argument("--enable-position-return-home", action="store_true")
+    parser.add_argument("--position-return-step-distance", type=float, default=0.6)
+    parser.add_argument("--position-return-hold-seconds", type=float, default=1.2)
+    parser.add_argument("--position-return-arrival-tolerance", type=float, default=0.35)
+    parser.add_argument("--position-return-max-distance", type=float, default=20.0)
     parser.add_argument("--return-home", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -1295,6 +1300,133 @@ async def soft_land_position_mode(
             3.0,
             f"soft land descent {altitude_m:.1f}m",
         )
+
+
+async def run_position_return_home(
+    drone: object,
+    rclpy: object,
+    monitor: LaserScanMonitor,
+    args: argparse.Namespace,
+    position_type: object,
+    start_north_m: float,
+    start_east_m: float,
+    home_north_m: float,
+    home_east_m: float,
+    down_m: float,
+    yaw_deg: float,
+) -> dict[str, Any]:
+    step_distance = max(0.01, args.position_return_step_distance)
+    hold_seconds = max(0.0, args.position_return_hold_seconds)
+    arrival_tolerance = max(0.0, args.position_return_arrival_tolerance)
+    max_distance = max(0.0, args.position_return_max_distance)
+    delta_north = home_north_m - start_north_m
+    delta_east = home_east_m - start_east_m
+    planned_distance = math.hypot(delta_north, delta_east)
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "attempted": False,
+        "status": "skipped",
+        "home_position": {
+            "north": round(home_north_m, 3),
+            "east": round(home_east_m, 3),
+            "altitude": round(max(0.0, -down_m), 3),
+        },
+        "start_position": {
+            "north": round(start_north_m, 3),
+            "east": round(start_east_m, 3),
+            "altitude": round(max(0.0, -down_m), 3),
+        },
+        "final_position": None,
+        "step_distance_m": round(step_distance, 3),
+        "steps": 0,
+        "actual_distance_m": 0.0,
+        "arrival_tolerance_m": round(arrival_tolerance, 3),
+        "planned_distance_m": round(planned_distance, 3),
+    }
+
+    log(
+        "RETURN",
+        f"position return-home enabled: start_N={start_north_m:.2f}, start_E={start_east_m:.2f}, "
+        f"home_N={home_north_m:.2f}, home_E={home_east_m:.2f}, distance={planned_distance:.2f}",
+    )
+    if planned_distance <= arrival_tolerance:
+        summary["status"] = "completed"
+        summary["final_position"] = summary["start_position"]
+        log("RETURN", "already within arrival tolerance; holding before land")
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            home_north_m,
+            home_east_m,
+            down_m,
+            yaw_deg,
+            hold_seconds,
+            "return-home final hold",
+        )
+        return summary
+
+    if planned_distance > max_distance:
+        summary["status"] = "timeout_or_limit"
+        summary["final_position"] = summary["start_position"]
+        log(
+            "RETURN",
+            f"return-home skipped: planned distance {planned_distance:.2f} m exceeds max {max_distance:.2f} m",
+        )
+        return summary
+
+    summary["attempted"] = True
+    step_count = max(1, math.ceil(planned_distance / step_distance))
+    traveled = 0.0
+    for step_index in range(step_count):
+        fraction = min(1.0, ((step_index + 1) * step_distance) / planned_distance)
+        target_north = start_north_m + delta_north * fraction
+        target_east = start_east_m + delta_east * fraction
+        previous_fraction = min(1.0, (step_index * step_distance) / planned_distance)
+        traveled += planned_distance * (fraction - previous_fraction)
+        rclpy.spin_once(monitor.node, timeout_sec=0.02)
+        front_diag = monitor.decision_snapshot().front_min
+        log(
+            "RETURN",
+            f"step={step_index + 1}/{step_count} target_N={target_north:.2f} "
+            f"target_E={target_east:.2f} traveled={traveled:.2f} front_diag={format_distance(front_diag)}",
+        )
+        await goto_position_ned(
+            drone,
+            rclpy,
+            monitor,
+            position_type,
+            target_north,
+            target_east,
+            down_m,
+            yaw_deg,
+            hold_seconds,
+            f"return-home step {step_index + 1}/{step_count}",
+        )
+        summary["steps"] = step_index + 1
+
+    final_position = await read_position_ned_quiet(drone)
+    if final_position is None:
+        final_north = home_north_m
+        final_east = home_east_m
+        summary["position_unavailable"] = True
+    else:
+        final_north = float(final_position.north_m)
+        final_east = float(final_position.east_m)
+        summary["position_unavailable"] = False
+
+    final_distance = math.hypot(final_north - home_north_m, final_east - home_east_m)
+    summary["actual_distance_m"] = round(traveled, 3)
+    summary["final_position"] = {
+        "north": round(final_north, 3),
+        "east": round(final_east, 3),
+        "altitude": round(max(0.0, -down_m), 3),
+    }
+    summary["final_distance_to_home_m"] = round(final_distance, 3)
+    summary["status"] = "completed" if final_distance <= arrival_tolerance else "timeout_or_limit"
+    log("RETURN", f"return-home status={summary['status']} final_distance={final_distance:.2f} m")
+    return summary
 
 
 def log_position_decision_scan(monitor: LaserScanMonitor, args: argparse.Namespace, context: str) -> None:
@@ -4130,6 +4262,8 @@ async def run_position_room_inspection_check(args: argparse.Namespace) -> int:
     current_east = 0.0
     down_m = -max(0.1, args.position_altitude)
     yaw_deg = float(args.position_yaw)
+    home_north = 0.0
+    home_east = 0.0
 
     log("CONFIG", "opening-based position room inspection check")
     log("CONFIG", f"system_address={args.system_address}")
@@ -4158,8 +4292,13 @@ async def run_position_room_inspection_check(args: argparse.Namespace) -> int:
         log("POS", "starting offboard position mode")
         await drone.offboard.start()
         offboard_started = True
+        home_position = await read_position_ned_quiet(drone)
+        if home_position is not None:
+            home_north = float(home_position.north_m)
+            home_east = float(home_position.east_m)
+        log("RETURN", f"mission local home anchor: N={home_north:.2f}, E={home_east:.2f}, yaw={yaw_deg:.1f}")
 
-        await run_position_room_inspection_steps(
+        payload = await run_position_room_inspection_steps(
             drone,
             rclpy,
             monitor,
@@ -4174,6 +4313,28 @@ async def run_position_room_inspection_check(args: argparse.Namespace) -> int:
         if final_position is not None:
             current_north = float(final_position.north_m)
             current_east = float(final_position.east_m)
+        if args.enable_position_return_home:
+            payload["return_home"] = await run_position_return_home(
+                drone,
+                rclpy,
+                monitor,
+                args,
+                position_type,
+                current_north,
+                current_east,
+                home_north,
+                home_east,
+                down_m,
+                yaw_deg,
+            )
+            write_inspection_events(args.inspection_events_output, payload)
+            return_final_position = await read_position_ned_quiet(drone)
+            if return_final_position is not None:
+                current_north = float(return_final_position.north_m)
+                current_east = float(return_final_position.east_m)
+        else:
+            payload["return_home"] = {"enabled": False, "attempted": False, "status": "skipped"}
+            write_inspection_events(args.inspection_events_output, payload)
         await soft_land_position_mode(drone, rclpy, monitor, position_type, current_north, current_east, yaw_deg)
         log("POS", "stopping offboard mode")
         await drone.offboard.stop()
