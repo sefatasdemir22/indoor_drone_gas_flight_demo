@@ -231,6 +231,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--position-yaw", type=float, default=90.0)
     parser.add_argument("--position-room-entry-distance", type=float, default=1.5)
     parser.add_argument("--position-room-entry-hold-seconds", type=float, default=2.5)
+    parser.add_argument("--position-opening-id-bucket-meters", type=float, default=0.5)
+    parser.add_argument("--position-opening-revisit-radius", type=float, default=0.8)
+    parser.add_argument("--position-opening-same-side-suppression-distance", type=float, default=2.0)
+    parser.add_argument("--position-opening-post-inspection-cooldown-steps", type=int, default=2)
     parser.add_argument("--enable-no-backtrack-door-capture", action="store_true")
     parser.add_argument("--door-capture-confirm-frames", type=int, default=3)
     parser.add_argument("--door-capture-crawl-step", type=float, default=0.15)
@@ -3033,6 +3037,11 @@ async def run_position_room_inspection_steps(
     current_north = 0.0
     current_east = 0.0
     active_candidate: OpeningCandidateState | None = None
+    inspected_opening_ids: set[str] = set()
+    suppressed_openings: list[dict[str, Any]] = []
+    last_position_inspection_step: int | None = None
+    last_position_inspection_side: str | None = None
+    completed_inspection_count = 0
     events: list[dict[str, Any]] = []
     payload: dict[str, Any] = {
         "requested_scenario": args.gas_scenario,
@@ -3051,9 +3060,97 @@ async def run_position_room_inspection_steps(
     log("POS", f"yaw={yaw_deg:.1f} deg")
     log("POS", f"room_entry_distance={room_entry_distance:.2f} m")
     log("POS", f"max_inspections={max_inspections}")
+    log(
+        "MULTI",
+        "position opening memory enabled: "
+        f"bucket={max(0.01, args.position_opening_id_bucket_meters):.2f} m "
+        f"revisit_radius={max(0.0, args.position_opening_revisit_radius):.2f} m "
+        f"same_side_suppression={max(0.0, args.position_opening_same_side_suppression_distance):.2f} m "
+        f"cooldown_steps={max(0, args.position_opening_post_inspection_cooldown_steps)}",
+    )
     log("CAPTURE", f"no_backtrack_enabled={args.enable_no_backtrack_door_capture}")
     log("ROOM", f"sensor_traversal_enabled={args.enable_sensor_room_traversal}")
     log("ROOM", f"room_facing_yaw_enabled={args.enable_room_facing_yaw_entry}")
+
+    def position_opening_identity(side: str, corridor_east: float) -> tuple[str, float]:
+        bucket_m = max(0.01, args.position_opening_id_bucket_meters)
+        bucketed_east = round(float(corridor_east) / bucket_m) * bucket_m
+        return f"{side}@east={bucketed_east:.1f}", bucketed_east
+
+    def position_opening_suppression_reason(side: str, corridor_east: float, step_index: int) -> str | None:
+        opening_id, bucketed_east = position_opening_identity(side, corridor_east)
+        if opening_id in inspected_opening_ids:
+            return f"already_inspected id={opening_id}"
+
+        cooldown_steps = max(0, args.position_opening_post_inspection_cooldown_steps)
+        if (
+            last_position_inspection_step is not None
+            and last_position_inspection_side == side
+            and step_index - last_position_inspection_step < cooldown_steps
+        ):
+            return (
+                f"post_inspection_cooldown side={side} "
+                f"step={step_index + 1} last={last_position_inspection_step + 1}"
+            )
+
+        same_side_suppression_distance = max(0.0, args.position_opening_same_side_suppression_distance)
+        for opening in suppressed_openings:
+            if opening["side"] != side:
+                continue
+            distance = abs(bucketed_east - float(opening["east"]))
+            if distance <= same_side_suppression_distance:
+                return (
+                    f"same_side_suppression id={opening['opening_id']} "
+                    f"distance={distance:.2f} threshold={same_side_suppression_distance:.2f}"
+                )
+
+        revisit_radius = max(0.0, args.position_opening_revisit_radius)
+        for opening in suppressed_openings:
+            if opening["side"] != side:
+                continue
+            distance = abs(bucketed_east - float(opening["east"]))
+            if distance <= revisit_radius:
+                return (
+                    f"spatial_revisit id={opening['opening_id']} "
+                    f"distance={distance:.2f} radius={revisit_radius:.2f}"
+                )
+        return None
+
+    def position_opening_is_suppressed(side: str, corridor_east: float, step_index: int, source: str) -> bool:
+        reason = position_opening_suppression_reason(side, corridor_east, step_index)
+        if reason is None:
+            return False
+        if active_candidate is not None and active_candidate.active_side == side:
+            reject_candidate(f"suppressed_{source}")
+        opening_id, bucketed_east = position_opening_identity(side, corridor_east)
+        log(
+            "MULTI",
+            f"suppress revisit source={source} side={side} id={opening_id} "
+            f"east={bucketed_east:.2f} reason={reason}",
+        )
+        return True
+
+    def remember_position_opening(side: str, corridor_east: float, step_index: int) -> str:
+        nonlocal last_position_inspection_step, last_position_inspection_side
+        opening_id, bucketed_east = position_opening_identity(side, corridor_east)
+        inspected_opening_ids.add(opening_id)
+        if not any(opening["opening_id"] == opening_id for opening in suppressed_openings):
+            suppressed_openings.append(
+                {
+                    "opening_id": opening_id,
+                    "side": side,
+                    "east": bucketed_east,
+                    "step_index": step_index,
+                }
+            )
+        last_position_inspection_step = step_index
+        last_position_inspection_side = side
+        log(
+            "MULTI",
+            f"remember inspected opening id={opening_id} side={side} "
+            f"east={bucketed_east:.2f} step={step_index + 1}",
+        )
+        return opening_id
 
     def reject_candidate(reason: str) -> None:
         nonlocal active_candidate
@@ -3066,16 +3163,25 @@ async def run_position_room_inspection_steps(
         )
         active_candidate = None
 
-    def capture_candidate_side(scan: ScanSnapshot) -> str | None:
-        left_open, _left_reason, _left_metrics = side_decision_diagnostics(scan, "left", args)
-        right_open, _right_reason, _right_metrics = side_decision_diagnostics(scan, "right", args)
-        if left_open and right_open:
-            return "left" if scan.left_avg >= scan.right_avg else "right"
-        if left_open:
-            return "left"
-        if right_open:
-            return "right"
-        return None
+    def capture_candidate_side(scan: ScanSnapshot, step_index: int, corridor_east: float) -> str | None:
+        candidates: list[tuple[str, float]] = []
+        for side in ("left", "right"):
+            is_open, _reason, _metrics = side_decision_diagnostics(scan, side, args)
+            if not is_open:
+                continue
+            suppress_reason = position_opening_suppression_reason(side, corridor_east, step_index)
+            if suppress_reason is not None:
+                opening_id, bucketed_east = position_opening_identity(side, corridor_east)
+                log(
+                    "MULTI",
+                    f"suppress revisit source=capture side={side} id={opening_id} "
+                    f"east={bucketed_east:.2f} reason={suppress_reason}",
+                )
+                continue
+            candidates.append((side, side_avg_for_snapshot(scan, side)))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[1])[0]
 
     async def update_candidate(step_index: int, phase: str) -> PositionOpeningAnchor | None:
         nonlocal active_candidate
@@ -3099,9 +3205,12 @@ async def run_position_room_inspection_steps(
             return None
 
         current_position = await read_position_ned_quiet(drone)
+        candidate_east = current_east if current_position is None else float(current_position.east_m)
         side_avg = side_avg_for_snapshot(scan, side_to_track)
         side_min = side_min_for_snapshot(scan, side_to_track)
         if active_candidate is None or active_candidate.active_side != side_to_track:
+            if position_opening_is_suppressed(side_to_track, candidate_east, step_index, "candidate"):
+                return None
             if active_candidate is not None:
                 reject_candidate("side_changed")
             active_candidate = OpeningCandidateState(
@@ -3745,13 +3854,16 @@ async def run_position_room_inspection_steps(
         }
 
     async def inspect_position_opening(anchor: PositionOpeningAnchor) -> None:
-        nonlocal current_north, current_east
-        if len(events) >= max_inspections:
+        nonlocal current_north, current_east, completed_inspection_count
+        if completed_inspection_count >= max_inspections:
             return
 
         side = anchor.side
         anchor_north = anchor.anchor_north
         anchor_east = anchor.anchor_east
+        if position_opening_is_suppressed(side, anchor_east, anchor.mature_step, "inspect"):
+            return
+
         if anchor.anchor_source == "door_capture_current":
             log(
                 "POS",
@@ -3780,7 +3892,7 @@ async def run_position_room_inspection_steps(
             )
             current_north = anchor_north
             current_east = anchor_east
-        opening_id = f"{side}@north={anchor_north:.1f},east={anchor_east:.1f}"
+        opening_id, _opening_east = position_opening_identity(side, anchor_east)
         baseline = await sample_gas_at_position(
             drone,
             rclpy,
@@ -3851,6 +3963,7 @@ async def run_position_room_inspection_steps(
             )
             events.append(event)
             write_inspection_events(args.inspection_events_output, payload)
+            remember_position_opening(side, anchor_east, anchor.mature_step)
             log("ROOM", "room-facing inspection aborted before entry; continuing corridor flow")
             return
 
@@ -3903,6 +4016,13 @@ async def run_position_room_inspection_steps(
         )
         events.append(event)
         write_inspection_events(args.inspection_events_output, payload)
+        remember_position_opening(side, anchor_east, anchor.mature_step)
+        completed_inspection_count += 1
+        log(
+            "MULTI",
+            f"completed inspections={completed_inspection_count}/{max_inspections} "
+            f"latest_opening={opening_id}",
+        )
 
         if traversal["mode"] == "room_facing_yaw":
             exit_summary = await exit_room_facing_yaw(
@@ -3954,9 +4074,9 @@ async def run_position_room_inspection_steps(
             hold_sec,
             f"corridor step {step_index + 1}/{step_count}",
         )
-        if args.enable_no_backtrack_door_capture and len(events) < max_inspections:
+        if args.enable_no_backtrack_door_capture and completed_inspection_count < max_inspections:
             scan = monitor.decision_snapshot()
-            opening_side = capture_candidate_side(scan)
+            opening_side = capture_candidate_side(scan, step_index, current_east)
             if opening_side is not None:
                 log(
                     "CAPTURE",
@@ -3967,15 +4087,15 @@ async def run_position_room_inspection_steps(
                 active_candidate = None
                 if anchor is not None:
                     await inspect_position_opening(anchor)
-                if len(events) >= max_inspections:
-                    log("POS", "max inspections reached; remaining steps only follow position corridor")
+                if completed_inspection_count >= max_inspections:
+                    log("POS", "max completed inspections reached; remaining steps only follow position corridor")
                 continue
 
         anchor = await update_candidate(step_index, "post-step")
-        if anchor is not None and len(events) < max_inspections:
+        if anchor is not None and completed_inspection_count < max_inspections:
             await inspect_position_opening(anchor)
-        if len(events) >= max_inspections:
-            log("POS", "max inspections reached; remaining steps only follow position corridor")
+        if completed_inspection_count >= max_inspections:
+            log("POS", "max completed inspections reached; remaining steps only follow position corridor")
 
     write_inspection_events(args.inspection_events_output, payload)
     log("POS", f"position inspection events written: {args.inspection_events_output}")
