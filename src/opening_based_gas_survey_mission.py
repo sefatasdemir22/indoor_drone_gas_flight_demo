@@ -16,6 +16,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from opening_event_builder import (
+    build_body_inspection_event,
+    build_position_abort_event,
+    build_position_inspection_event,
+)
 from opening_mission_types import (
     Decision,
     DryRunSummary,
@@ -2064,28 +2069,21 @@ async def run_room_inspection_steps(
         else:
             log("GAS", f"no significant gas increase at opening={opening_id}")
 
-        event = {
-            "inspection_index": len(events) + 1,
-            "side": side,
-            "opening_id": opening_id,
-            "step_index": step_index + 1,
-            "baseline_avg_ppm": round(baseline.avg_ppm, 3),
-            "inspection_avg_ppm": round(inspection.avg_ppm, 3),
-            "delta_ppm": round(delta_ppm, 3),
-            "gas_candidate": gas_candidate,
-            "candidate_reason": reason,
-            "baseline_sample_count": baseline.sample_count,
-            "inspection_sample_count": inspection.sample_count,
-            "baseline_position": baseline.position,
-            "inspection_position": inspection.position,
-            "entry_anchor_position": position_as_event_dict(entry_anchor_position),
-            "enter_target_distance_m": round(max(0.0, args.inspection_enter_distance), 3),
-            "enter_actual_distance_m": enter_result["actual_distance_m"],
-            "enter_elapsed_seconds": enter_result["elapsed_seconds"],
-            "exit_tolerance_m": round(max(0.0, args.inspection_exit_tolerance), 3),
-            "exit_final_distance_m": None,
-            "exit_elapsed_seconds": None,
-        }
+        event = build_body_inspection_event(
+            inspection_index=len(events) + 1,
+            side=side,
+            opening_id=opening_id,
+            step_index=step_index,
+            baseline=baseline,
+            inspection=inspection,
+            delta_ppm=delta_ppm,
+            gas_candidate=gas_candidate,
+            candidate_reason=reason,
+            entry_anchor_position=entry_anchor_position,
+            enter_target_distance_m=args.inspection_enter_distance,
+            enter_result=enter_result,
+            exit_tolerance_m=args.inspection_exit_tolerance,
+        )
         events.append(event)
         write_inspection_events(args.inspection_events_output, payload)
 
@@ -3838,66 +3836,19 @@ async def run_position_room_inspection_steps(
             }
 
         if traversal.get("room_facing_aborted"):
-            event = {
-                "inspection_index": len(events) + 1,
-                "side": side,
-                "opening_id": opening_id,
-                "step_index": anchor.mature_step + 1,
-                "candidate_start_step": anchor.start_step + 1,
-                "candidate_mature_step": anchor.mature_step + 1,
-                "baseline_avg_ppm": round(baseline.avg_ppm, 3),
-                "inspection_avg_ppm": None,
-                "delta_ppm": None,
-                "gas_candidate": False,
-                "candidate_reason": traversal["stop_reason"],
-                "baseline_sample_count": baseline.sample_count,
-                "inspection_sample_count": 0,
-                "baseline_position": baseline.position,
-                "inspection_position": None,
-                "entry_anchor_position": {"north": round(anchor_north, 3), "east": round(anchor_east, 3), "altitude": -down_m},
-                "entry_anchor_source": anchor.anchor_source,
-                "candidate_start_position": position_as_event_dict(anchor.start_position),
-                "candidate_mature_position": position_as_event_dict(anchor.mature_position),
-                "candidate_best_position": position_as_event_dict(anchor.best_position),
-                "candidate_best_side_avg": round(anchor.best_side_avg, 3),
-                "candidate_frames_seen": anchor.frames_seen,
-                "enter_target_distance_m": round(room_entry_distance, 3),
-                "enter_actual_distance_m": 0.0,
-                "room_traversal_mode": traversal["mode"],
-                "room_traverse_stop_distance_m": traversal["stop_distance_m"],
-                "room_traverse_step_distance_m": traversal["step_distance_m"],
-                "room_traverse_max_distance_m": traversal["max_distance_m"],
-                "room_traverse_actual_distance_m": traversal["actual_distance_m"],
-                "room_traverse_stop_reason": traversal["stop_reason"],
-                "room_direction_scan": traversal["direction_scan"],
-                "room_final_side_min_m": traversal["final_side_min_m"],
-                "room_final_side_avg_m": traversal["final_side_avg_m"],
-                "room_depth_estimate_m": traversal["depth_estimate_m"],
-                "room_width_estimate_m": traversal["width_estimate_m"],
-                "room_facing_yaw_deg": traversal.get("room_facing_yaw_deg"),
-                "room_facing_final_front_min_m": traversal.get("room_facing_final_front_min_m"),
-                "room_facing_exit_steps": traversal.get("room_facing_exit_steps"),
-                "room_facing_exit_actual_distance_m": traversal.get("room_facing_exit_actual_distance_m"),
-                "room_facing_door_forward_offset_m": traversal.get("room_facing_door_forward_offset_m"),
-                "room_facing_yaw_hold_before_seconds": round(max(0.0, args.room_facing_yaw_hold_before_seconds), 3),
-                "room_facing_yaw_hold_after_seconds": round(max(0.0, args.room_facing_yaw_hold_after_seconds), 3),
-                "room_facing_yaw_settle_repeat_count": max(1, args.room_facing_yaw_settle_repeat_count),
-                "room_facing_yaw_interpolation_step_deg": round(max(0.0, args.room_facing_yaw_interpolation_step_deg), 3),
-                "room_facing_yaw_interpolation_hold_seconds": round(
-                    max(0.0, args.room_facing_yaw_interpolation_hold_seconds),
-                    3,
-                ),
-                "room_facing_post_yaw_realign_enabled": traversal.get("room_facing_post_yaw_realign_enabled"),
-                "room_facing_post_yaw_total_offset_m": traversal.get("room_facing_post_yaw_total_offset_m"),
-                "room_facing_post_yaw_front_min_m": traversal.get("room_facing_post_yaw_front_min_m"),
-                "room_facing_post_yaw_realign_steps": traversal.get("room_facing_post_yaw_realign_steps"),
-                "room_facing_entry_anchor_position": {
-                    "north": traversal.get("room_facing_entry_anchor_north"),
-                    "east": traversal.get("room_facing_entry_anchor_east"),
-                    "altitude": -down_m,
-                },
-                "exit_final_distance_m": None,
-            }
+            event = build_position_abort_event(
+                inspection_index=len(events) + 1,
+                side=side,
+                opening_id=opening_id,
+                anchor=anchor,
+                anchor_north=anchor_north,
+                anchor_east=anchor_east,
+                down_m=down_m,
+                room_entry_distance=room_entry_distance,
+                baseline=baseline,
+                traversal=traversal,
+                args=args,
+            )
             events.append(event)
             write_inspection_events(args.inspection_events_output, payload)
             log("ROOM", "room-facing inspection aborted before entry; continuing corridor flow")
@@ -3932,74 +3883,24 @@ async def run_position_room_inspection_steps(
             f"delta={delta_ppm:.2f}, candidate={gas_candidate}, reason={reason}",
         )
 
-        event = {
-            "inspection_index": len(events) + 1,
-            "side": side,
-            "opening_id": opening_id,
-            "step_index": anchor.mature_step + 1,
-            "candidate_start_step": anchor.start_step + 1,
-            "candidate_mature_step": anchor.mature_step + 1,
-            "baseline_avg_ppm": round(baseline.avg_ppm, 3),
-            "inspection_avg_ppm": round(inspection.avg_ppm, 3),
-            "delta_ppm": round(delta_ppm, 3),
-            "gas_candidate": gas_candidate,
-            "candidate_reason": reason,
-            "baseline_sample_count": baseline.sample_count,
-            "inspection_sample_count": inspection.sample_count,
-            "baseline_position": baseline.position,
-            "inspection_position": inspection.position,
-            "entry_anchor_position": {"north": round(anchor_north, 3), "east": round(anchor_east, 3), "altitude": -down_m},
-            "entry_anchor_source": anchor.anchor_source,
-            "candidate_start_position": position_as_event_dict(anchor.start_position),
-            "candidate_mature_position": position_as_event_dict(anchor.mature_position),
-            "candidate_best_position": position_as_event_dict(anchor.best_position),
-            "candidate_best_side_avg": round(anchor.best_side_avg, 3),
-            "candidate_frames_seen": anchor.frames_seen,
-            "enter_target_distance_m": round(room_entry_distance, 3),
-            "enter_actual_distance_m": (
-                traversal["actual_distance_m"]
-                if traversal["mode"] == "room_facing_yaw"
-                else round(abs(entry_north - anchor_north), 3)
-            ),
-            "room_traversal_mode": traversal["mode"],
-            "room_traverse_stop_distance_m": traversal["stop_distance_m"],
-            "room_traverse_step_distance_m": traversal["step_distance_m"],
-            "room_traverse_max_distance_m": traversal["max_distance_m"],
-            "room_traverse_actual_distance_m": traversal["actual_distance_m"],
-            "room_traverse_stop_reason": traversal["stop_reason"],
-            "room_direction_scan": traversal["direction_scan"],
-            "room_final_side_min_m": traversal["final_side_min_m"],
-            "room_final_side_avg_m": traversal["final_side_avg_m"],
-            "room_depth_estimate_m": traversal["depth_estimate_m"],
-            "room_width_estimate_m": traversal["width_estimate_m"],
-            "room_facing_yaw_deg": traversal.get("room_facing_yaw_deg"),
-            "room_facing_final_front_min_m": traversal.get("room_facing_final_front_min_m"),
-            "room_facing_exit_steps": traversal.get("room_facing_exit_steps"),
-            "room_facing_exit_actual_distance_m": traversal.get("room_facing_exit_actual_distance_m"),
-            "room_facing_door_forward_offset_m": traversal.get("room_facing_door_forward_offset_m"),
-            "room_facing_yaw_hold_before_seconds": round(max(0.0, args.room_facing_yaw_hold_before_seconds), 3),
-            "room_facing_yaw_hold_after_seconds": round(max(0.0, args.room_facing_yaw_hold_after_seconds), 3),
-            "room_facing_yaw_settle_repeat_count": max(1, args.room_facing_yaw_settle_repeat_count),
-            "room_facing_yaw_interpolation_step_deg": round(max(0.0, args.room_facing_yaw_interpolation_step_deg), 3),
-            "room_facing_yaw_interpolation_hold_seconds": round(
-                max(0.0, args.room_facing_yaw_interpolation_hold_seconds),
-                3,
-            ),
-            "room_facing_post_yaw_realign_enabled": traversal.get("room_facing_post_yaw_realign_enabled"),
-            "room_facing_post_yaw_total_offset_m": traversal.get("room_facing_post_yaw_total_offset_m"),
-            "room_facing_post_yaw_front_min_m": traversal.get("room_facing_post_yaw_front_min_m"),
-            "room_facing_post_yaw_realign_steps": traversal.get("room_facing_post_yaw_realign_steps"),
-            "room_facing_entry_anchor_position": (
-                {
-                    "north": traversal.get("room_facing_entry_anchor_north"),
-                    "east": traversal.get("room_facing_entry_anchor_east"),
-                    "altitude": -down_m,
-                }
-                if traversal.get("room_facing_entry_anchor_north") is not None
-                else None
-            ),
-            "exit_final_distance_m": None,
-        }
+        event = build_position_inspection_event(
+            inspection_index=len(events) + 1,
+            side=side,
+            opening_id=opening_id,
+            anchor=anchor,
+            anchor_north=anchor_north,
+            anchor_east=anchor_east,
+            down_m=down_m,
+            room_entry_distance=room_entry_distance,
+            entry_north=entry_north,
+            baseline=baseline,
+            inspection=inspection,
+            delta_ppm=delta_ppm,
+            gas_candidate=gas_candidate,
+            candidate_reason=reason,
+            traversal=traversal,
+            args=args,
+        )
         events.append(event)
         write_inspection_events(args.inspection_events_output, payload)
 
