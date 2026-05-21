@@ -2,6 +2,10 @@
 
 Bu klasor eski `araswarm_simulation` altyapisindan kopyalanmistir.
 
+Guncel onerilen demo akisi icin `README.md` ve `docs/demo_cookbook.md`
+dosyalarina bakilmalidir. Bu dosya daha cok eski altyapi ve tasima notlarini
+korur.
+
 - Baslatma sirasi eski calisan `baslat.sh` mantigini korur.
 - `MicroXRCEAgent`, Gazebo world, PX4 brain ve `spawn_entity.py` sirasi korunmustur.
 - World dosyasi `simple_corridor_room.world` olarak degistirilmistir.

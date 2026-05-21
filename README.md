@@ -1,16 +1,17 @@
 # Indoor Drone Gas Flight Demo
 
-PX4/Gazebo tabanlı bu demo, GPS olmayan kapalı ortamda drone'un koridorda ilerlemesini, oda/açıklık adaylarını algılamasını, oda içine yönelip gaz örneği almasını ve koridora geri dönmesini gösterir.
+PX4/Gazebo tabanli bu demo, GPS olmayan kapali ortamda drone'un koridorda ilerlemesini, gordugu farkli oda/acikliklari inspection etmesini, gaz olcumu almasini, koridora geri donmesini ve gorev sonunda local home noktasina return-home yapip yumusak inmesini gosterir.
 
 Mevcut ana checkpoint:
 
-- `133f89f Add room-facing yaw interpolation`
-- Ana görev scripti: `src/opening_based_gas_survey_mission.py`
-- Ana çıktı: `results/opening_inspection_events.json`
+- Git checkpoint: `ce86e82 Add inspect-all openings mission mode`
+- Tag: `milestone_inspect_all_v1`
+- Ana gorev scripti: `src/opening_based_gas_survey_mission.py`
+- Ana cikti: `results/opening_inspection_events.json`
 
-Bu proje tam SLAM, global planner veya tam bilinmeyen ortam keşfi iddiası taşımaz. Mevcut hedef, sınırlı corridor-room dünyasında güvenli ve açıklık tabanlı oda inspection akışını doğrulamaktır.
+Bu proje tam SLAM, global planner veya bilinmeyen ortam topoloji haritasi iddiasi tasimaz. Mevcut hedef, sinirli corridor-room dunyasinda LaserScan tabanli aciklik algilama, coklu oda inspection, return-home ve stabil landing akisini dogrulamaktir.
 
-## Kullanılan Teknolojiler
+## Kullanilan Teknolojiler
 
 - ROS2 Humble
 - Gazebo Classic
@@ -19,93 +20,84 @@ Bu proje tam SLAM, global planner veya tam bilinmeyen ortam keşfi iddiası taş
 - MAVSDK
 - Python
 
-## Mevcut Çalışan Akış
+## Guncel Calisan Akis
 
-Ana room-inspection akışı şu davranışları içerir:
+Ana position-mode room-inspection akisi su davranislari icerir:
 
+- inspect-all openings modu
 - opening candidate detection
+- same-side suppression ile ayni odaya tekrar girmeme
 - no-backtrack door capture
 - door forward offset
 - room-facing yaw entry
 - yaw interpolation
 - post-yaw realignment
-- front-distance stop
-- gas baseline ve inspection ölçümü
+- front-distance stop traversal
+- gas baseline ve inspection olcumu
 - incremental room exit
 - corridor continuation
-- `max_inspections` policy
+- return-home
+- staged landing stabilization
 
-Drone oda koordinatlarını önceden bilmez. Açıklık adayları LaserScan tabanlı karar mantığıyla algılanır. Oda içine girişte drone yaw değiştirerek odaya kendi front yönüyle girer; oda içinde durma kararı `front_min` mesafesine dayanır.
+Drone oda koordinatlarini onceden bilmez. Aciklik adaylari dar decision LaserScan verileriyle algilanir. Oda icine giriste drone yaw degistirerek odaya kendi front yonuyle girer; oda icinde durma karari `front_min` mesafesine dayanir.
 
-## Başlatma
+## Baslatma
 
 Terminal 1:
 
 ```bash
-cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
+cd ~/Desktop/indoor_drone_gas_flight_demo
 ./baslat.sh
 ```
 
-Bu komut Gazebo GUI, `simple_corridor_room.world`, PX4 SITL ve iris spawn akışını başlatır.
+Bu komut Gazebo GUI, `simple_corridor_room.world`, PX4 SITL ve iris spawn akisini baslatir.
 
-Topic kontrolü için:
+Topic kontrolu icin:
 
 ```bash
 ros2 topic list | grep -Ei "front_scan|left_scan|right_scan|decision_scan|vehicle_local_position"
 ```
 
-## Ana Room-Facing Mission Komutu
+## Ana Inspect-All Mission Komutu
 
 Terminal 2:
 
 ```bash
-cd /home/sefa/Desktop/indoor_drone_gas_flight_demo
+cd ~/Desktop/indoor_drone_gas_flight_demo
 python3 src/opening_based_gas_survey_mission.py \
   --position-room-inspection-check \
+  --inspect-all-openings \
   --enable-no-backtrack-door-capture \
   --enable-room-facing-yaw-entry \
   --enable-room-facing-post-yaw-realign \
-  --position-step-count 30 \
-  --position-forward-step 0.4 \
-  --position-hold-seconds 2.5 \
-  --position-altitude 1.2 \
-  --position-yaw 90.0 \
-  --room-facing-step-distance 0.25 \
-  --room-facing-max-distance 8.0 \
+  --enable-position-return-home \
+  --enable-position-landing-stabilization \
   --room-facing-front-stop-distance 1.5 \
-  --room-facing-exit-step-distance 0.5 \
-  --room-facing-step-hold-seconds 0.8 \
-  --room-facing-door-forward-offset 0.25 \
-  --room-facing-yaw-hold-before-seconds 0.5 \
-  --room-facing-yaw-hold-after-seconds 1.0 \
-  --room-facing-yaw-settle-repeat-count 5 \
-  --room-facing-yaw-settle-repeat-interval 0.2 \
-  --room-facing-yaw-interpolation-step-deg 15 \
-  --room-facing-yaw-interpolation-hold-seconds 0.2 \
-  --room-facing-post-yaw-min-front-clearance 2.0 \
-  --room-facing-post-yaw-forward-offset-step 0.10 \
-  --room-facing-post-yaw-max-forward-offset 0.30 \
-  --door-capture-confirm-frames 3 \
-  --door-capture-crawl-step 0.15 \
-  --door-capture-max-crawl-steps 2 \
-  --door-capture-hold-seconds 0.8 \
-  --max-inspections 1 \
+  --max-inspections 5 \
   --gas-scenario possible_gas_zone_4 \
   --gas-seed 1
 ```
 
-Bu komut tek inspection sonrası corridor continuation davranışını da gözlemlemek için uzun tutulmuştur. `--max-inspections 1` ikinci opening adayını intentionally inspect etmez.
+Bu README komutu ana modlari gosterir. Tam validasyon parametreleri icin `docs/demo_cookbook.md` dosyasindaki "Current Inspect-All Mission" komutu kullanilmalidir.
+
+`--inspect-all-openings` aktifken `--max-inspections` hedef oda sayisi degil, safety cap olarak kullanilir. Mevcut demo dunyasinda birden fazla farkli opening inspection edilmesi, ayni opening devamlarinin suppression ile atlanmasi, return-home'un tamamlanmasi ve staged landing'in calismasi beklenir.
 
 ## Event JSON
 
-Mission sonucu şu dosyaya yazılır:
+Mission sonucu su dosyaya yazilir:
 
 ```text
 results/opening_inspection_events.json
 ```
 
-Önemli alanlar:
+Ust seviye alanlar:
 
+- `events`
+- `return_home`
+
+Her event icin onemli alanlar:
+
+- `inspection_index`
 - `side`
 - `opening_id`
 - `entry_anchor_source`
@@ -120,14 +112,24 @@ results/opening_inspection_events.json
 - `room_facing_yaw_interpolation_step_deg`
 - `room_facing_exit_steps`
 
-Son başarılı checkpoint testlerinde `room_traversal_mode="room_facing_yaw"` ve `room_traverse_stop_reason="front_stop_distance"` üretilmiştir.
+Return-home icin onemli alanlar:
+
+- `enabled`
+- `attempted`
+- `status`
+- `steps`
+- `actual_distance_m`
+- `final_distance_to_home_m`
+
+Basarili inspect-all checkpoint testinde birden fazla valid event uretilir ve `return_home.status="completed"` beklenir.
 
 ## Dry-Run Kontrolleri
 
-PX4/Gazebo başlatmadan hızlı kontrol:
+PX4/Gazebo baslatmadan hizli kontrol:
 
 ```bash
 python3 -m py_compile src/opening_based_gas_survey_mission.py
+python3 -m py_compile src/opening_event_builder.py
 python3 -m py_compile src/opening_mission_types.py
 python3 -m py_compile src/opening_scan_decision.py
 python3 src/opening_based_gas_survey_mission.py --dry-run --dry-run-scenario normal_corridor_side_distance
@@ -139,9 +141,9 @@ Beklenen:
 - `normal_corridor_side_distance` -> `FOLLOW_FORWARD`
 - `front_blocked_left_open` -> `BYPASS_LEFT`
 
-## Yardımcı Gaz Görselleştirme
+## Yardimci Gaz Gorsellestirme
 
-Gaz heatmap araçları hâlâ ayrı kullanılabilir. Bunlar drone'u kontrol etmez; CSV/JSON/PNG üretir.
+Gaz heatmap araclari ayri kullanilabilir. Bunlar drone'u kontrol etmez; CSV/JSON/PNG uretir.
 
 ```bash
 ./scripts/run_mapper.sh random
@@ -150,7 +152,7 @@ Gaz heatmap araçları hâlâ ayrı kullanılabilir. Bunlar drone'u kontrol etme
 ./scripts/run_mapper.sh multi_all
 ```
 
-Live ROS2 gas mapping de ayrı bir yardımcı akıştır:
+Live ROS2 gas mapping de ayri bir yardimci akistir:
 
 ```bash
 python3 src/live_gas_mapping_ros2.py \
@@ -162,29 +164,29 @@ python3 src/live_gas_mapping_ros2.py \
   --route-min-altitude 0.5
 ```
 
-## Legacy / Diagnostic Akışlar
+## Legacy / Diagnostic Akislar
 
-Repo içinde önceki fazlardan kalan diagnostic scriptler korunur:
+Repo icinde onceki fazlardan kalan diagnostic scriptler korunur:
 
 - `src/mission_manager.py`
 - `src/safe_corridor_mission.py`
-- velocity/crab-mode inspection seçenekleri
+- velocity/crab-mode inspection secenekleri
+- `--position-side-sign-check`
 
-Bunlar ana demo akışı değildir. Ana güncel demo `src/opening_based_gas_survey_mission.py --position-room-inspection-check` ve room-facing yaw modudur.
+Bunlar ana demo akisi degildir. Ana guncel demo `src/opening_based_gas_survey_mission.py --position-room-inspection-check --inspect-all-openings` ve room-facing yaw modudur.
 
-## Bilinen Sınırlar
+## Bilinen Sinirlar
 
 - Full SLAM yok.
 - Global planner yok.
-- Return-home henüz ana mission akışında yok.
-- Multi-room inspection henüz checkpoint olarak alınmadı.
-- Landing bounce bazı testlerde gözlendi; ayrı landing stability konusu.
-- Gas candidate boolean threshold konservatif; düşük delta değerleri event JSON'da görünse de `gas_candidate=false` kalabilir.
-- Red/low obstacles ve lidar geometri sınırları simülasyon dünyasına bağlıdır.
+- `position_step_count` halen corridor mission siniridir.
+- `max_inspections`, inspect-all modunda safety cap olarak kalir.
+- Gas candidate boolean threshold konservatiftir; delta degerleri event JSON'da gorunse de `gas_candidate=false` kalabilir.
+- Red/low obstacle ve lidar geometri sinirlari simulasyon dunyasina baglidir.
+- Yuksek gaz bulununca gorevi erken bitirme henuz eklenmedi.
 
-## Ek Dokümantasyon
+## Ek Dokumantasyon
 
-- `docs/phase_checkpoint.md`: güncel checkpoint özeti
-- `docs/demo_cookbook.md`: test ve demo komutları
-- `docs/flight_demo_notes.md`: eski altyapı notları
-
+- `docs/phase_checkpoint.md`: guncel checkpoint ozeti
+- `docs/demo_cookbook.md`: test ve demo komutlari
+- `docs/flight_demo_notes.md`: eski altyapi notlari
