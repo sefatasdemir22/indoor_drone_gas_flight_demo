@@ -188,6 +188,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-duration-seconds", type=float, default=1.5)
     parser.add_argument("--probe-max-count", type=int, default=1)
     parser.add_argument("--max-inspections", type=int, default=2)
+    parser.add_argument("--inspect-all-openings", action="store_true")
     parser.add_argument("--inspection-side-speed", type=float, default=0.12)
     parser.add_argument("--inspection-enter-seconds", type=float, default=1.8)
     parser.add_argument("--inspection-hover-seconds", type=float, default=3.0)
@@ -3219,6 +3220,9 @@ async def run_position_room_inspection_steps(
     log("POS", f"yaw={yaw_deg:.1f} deg")
     log("POS", f"room_entry_distance={room_entry_distance:.2f} m")
     log("POS", f"max_inspections={max_inspections}")
+    log("POS", f"inspect_all_openings={args.inspect_all_openings}")
+    if args.inspect_all_openings:
+        log("POS", "max_inspections is used as a safety cap while corridor stepping continues")
     log(
         "MULTI",
         "position opening memory enabled: "
@@ -4015,6 +4019,8 @@ async def run_position_room_inspection_steps(
     async def inspect_position_opening(anchor: PositionOpeningAnchor) -> None:
         nonlocal current_north, current_east, completed_inspection_count
         if completed_inspection_count >= max_inspections:
+            if args.inspect_all_openings:
+                log("POS", "inspection safety cap reached; skipping new inspection and continuing corridor")
             return
 
         side = anchor.side
@@ -4247,14 +4253,20 @@ async def run_position_room_inspection_steps(
                 if anchor is not None:
                     await inspect_position_opening(anchor)
                 if completed_inspection_count >= max_inspections:
-                    log("POS", "max completed inspections reached; remaining steps only follow position corridor")
+                    if args.inspect_all_openings:
+                        log("POS", "inspection safety cap reached; continuing corridor to mission end")
+                    else:
+                        log("POS", "max completed inspections reached; remaining steps only follow position corridor")
                 continue
 
         anchor = await update_candidate(step_index, "post-step")
         if anchor is not None and completed_inspection_count < max_inspections:
             await inspect_position_opening(anchor)
         if completed_inspection_count >= max_inspections:
-            log("POS", "max completed inspections reached; remaining steps only follow position corridor")
+            if args.inspect_all_openings:
+                log("POS", "inspection safety cap reached; continuing corridor to mission end")
+            else:
+                log("POS", "max completed inspections reached; remaining steps only follow position corridor")
 
     write_inspection_events(args.inspection_events_output, payload)
     log("POS", f"position inspection events written: {args.inspection_events_output}")
