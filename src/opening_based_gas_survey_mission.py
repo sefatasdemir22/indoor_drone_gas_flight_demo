@@ -268,6 +268,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--position-return-hold-seconds", type=float, default=1.2)
     parser.add_argument("--position-return-arrival-tolerance", type=float, default=0.35)
     parser.add_argument("--position-return-max-distance", type=float, default=20.0)
+    parser.add_argument("--enable-position-landing-stabilization", action="store_true")
+    parser.add_argument("--position-landing-final-altitude", type=float, default=0.22)
+    parser.add_argument("--position-landing-step-hold-seconds", type=float, default=2.0)
+    parser.add_argument("--position-landing-final-hold-seconds", type=float, default=2.0)
     parser.add_argument("--return-home", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -1283,11 +1287,32 @@ async def soft_land_position_mode(
     rclpy: object,
     monitor: LaserScanMonitor,
     position_type: object,
+    args: argparse.Namespace,
     north_m: float,
     east_m: float,
     yaw_deg: float,
 ) -> None:
-    for altitude_m in (1.0, 0.7, 0.4):
+    if args.enable_position_landing_stabilization:
+        step_hold_sec = max(0.0, args.position_landing_step_hold_seconds)
+        final_hold_sec = max(0.0, args.position_landing_final_hold_seconds)
+        final_altitude = max(0.05, args.position_landing_final_altitude)
+        altitude_profile = [1.0, 0.7, 0.45, 0.30, final_altitude]
+    else:
+        step_hold_sec = 3.0
+        final_hold_sec = 3.0
+        altitude_profile = [1.0, 0.7, 0.4]
+
+    for index, altitude_m in enumerate(altitude_profile):
+        hold_sec = final_hold_sec if index == len(altitude_profile) - 1 else step_hold_sec
+        position = await read_position_ned_quiet(drone)
+        altitude_text = "unavailable"
+        if position is not None:
+            altitude_text = f"{max(0.0, -float(position.down_m)):.2f} m"
+        log(
+            "LAND",
+            f"staged descent target_altitude={altitude_m:.2f} m "
+            f"estimated_altitude={altitude_text} hold={hold_sec:.1f}s",
+        )
         await goto_position_ned(
             drone,
             rclpy,
@@ -1297,9 +1322,11 @@ async def soft_land_position_mode(
             east_m,
             -altitude_m,
             yaw_deg,
-            3.0,
+            hold_sec,
             f"soft land descent {altitude_m:.1f}m",
         )
+    if args.enable_position_landing_stabilization:
+        log("LAND", "final low hover complete before land command")
 
 
 async def run_position_return_home(
@@ -4335,7 +4362,7 @@ async def run_position_room_inspection_check(args: argparse.Namespace) -> int:
         else:
             payload["return_home"] = {"enabled": False, "attempted": False, "status": "skipped"}
             write_inspection_events(args.inspection_events_output, payload)
-        await soft_land_position_mode(drone, rclpy, monitor, position_type, current_north, current_east, yaw_deg)
+        await soft_land_position_mode(drone, rclpy, monitor, position_type, args, current_north, current_east, yaw_deg)
         log("POS", "stopping offboard mode")
         await drone.offboard.stop()
         offboard_started = False
@@ -4463,7 +4490,7 @@ async def run_position_side_sign_check(args: argparse.Namespace) -> int:
         final_position = await read_position_ned_quiet(drone)
         land_north = center_north if final_position is None else float(final_position.north_m)
         land_east = center_east if final_position is None else float(final_position.east_m)
-        await soft_land_position_mode(drone, rclpy, monitor, position_type, land_north, land_east, yaw_deg)
+        await soft_land_position_mode(drone, rclpy, monitor, position_type, args, land_north, land_east, yaw_deg)
         log("POS", "stopping offboard mode")
         await drone.offboard.stop()
         offboard_started = False
