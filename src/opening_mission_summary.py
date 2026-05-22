@@ -71,12 +71,17 @@ def event_with_max(events: list[dict[str, Any]], field: str) -> dict[str, Any] |
 def mission_status(completed_count: int, return_home: dict[str, Any]) -> str:
     return_status = return_home.get("status")
     if completed_count <= 0:
-        return "no_completed_inspections"
+        return "failed"
     if return_status == "completed":
         return "completed"
-    if return_home.get("enabled") is False or return_status == "skipped":
-        return "completed_without_return_home"
-    return "completed_with_return_home_issue"
+    return "partial"
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(Path.cwd().resolve()))
+    except ValueError:
+        return str(path)
 
 
 def build_summary(payload: dict[str, Any], source_path: Path) -> dict[str, Any]:
@@ -96,13 +101,14 @@ def build_summary(payload: dict[str, Any], source_path: Path) -> dict[str, Any]:
 
     return {
         "mission_status": mission_status(len(completed), return_home),
-        "source_event_file": str(source_path),
+        "source_event_file": display_path(source_path),
         "scenario": payload.get("scenario"),
         "requested_scenario": payload.get("requested_scenario"),
         "gas_seed": payload.get("gas_seed"),
         "completed_inspections": len(completed),
         "event_count": len(valid_events),
         "inspected_openings": [opening_summary(event) for event in completed],
+        "strongest_room_strategy": "highest_delta_ppm",
         "strongest_room": opening_summary(strongest_event) if strongest_event else None,
         "highest_ppm": round(highest_ppm, 3) if highest_ppm is not None else None,
         "highest_delta_ppm": round(highest_delta, 3) if highest_delta is not None else None,
