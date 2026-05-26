@@ -104,7 +104,19 @@ Quick validation checklist:
 - `return_home.status` is `completed`.
 - Landing logs show staged descent to the configured final altitude.
 
-## 6. Optional Gas Heatmap Tools
+## 6. Thesis Asset Curation
+
+Generated runtime outputs stay under `results/` and are ignored by Git. Copy
+only selected final thesis/presentation assets into:
+
+- `thesis_assets/figures/`
+- `thesis_assets/tables/`
+- `thesis_assets/package/`
+
+Do not use `thesis_assets/` as a full mirror of `results/`; keep it as a small
+curated set for the thesis, presentation, and delivery package.
+
+## 7. Optional Gas Heatmap Tools
 
 These tools do not command the drone.
 

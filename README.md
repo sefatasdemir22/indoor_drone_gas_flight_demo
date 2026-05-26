@@ -118,6 +118,19 @@ Return-home icin onemli alanlar:
 
 Basarili inspect-all checkpoint testinde birden fazla valid event uretilir ve `return_home.status="completed"` beklenir.
 
+## Tez ve Sunum Ciktilari
+
+Runtime ve post-process ciktilari `results/` altinda uretilir ve Git'e alinmaz.
+Tez/sunum icin secilen final gorsel, tablo ve teslim paketleri elle
+`thesis_assets/` altina kopyalanabilir:
+
+- `thesis_assets/figures/`: final heatmap, 3D visualization, screenshot ve sunum gorselleri
+- `thesis_assets/tables/`: final CSV/tablo ciktilari
+- `thesis_assets/package/`: teslim veya paylasim paketleri
+
+Bu klasorler secilmis tez artefactlari icindir; ham `results/` klasorunun
+tam kopyasi olarak kullanilmamalidir.
+
 ## Dry-Run Kontrolleri
 
 PX4/Gazebo baslatmadan hizli kontrol:

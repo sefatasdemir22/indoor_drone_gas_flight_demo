@@ -13,6 +13,7 @@ install/
 .idea/
 .DS_Store
 results/
+run_room_test.sh
 
 # Large legacy SubT cave assets kept local
 src/gas_distribution_sim/models/subt_cave_sim/
