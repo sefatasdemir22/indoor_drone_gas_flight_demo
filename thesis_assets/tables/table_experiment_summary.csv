@@ -1,0 +1,4 @@
+experiment_id,scenario,gas_seed,runtime_sec,expected_room_count,completed_inspections,coverage_pass,mission_status,highest_ppm,highest_delta_ppm,strongest_room,return_home_status,csv_rows,heatmap_generated,notes
+S1_no_gas_seed1,no_gas,1,420,3,3,true,completed,5.187,0.136,left@east=4.0,completed,3,true,S1 no-gas false-positive check
+S2_single_source_seed1,possible_gas_zone_4,1,420,3,3,true,completed,8.095,3.099,left@east=4.0,completed,3,true,S2 single source validation
+S3_multi_source_seed1,multi_1_2,1,420,3,3,true,completed,119.577,111.947,left@east=4.0,completed,3,true,S3 multi-source room-level comparison run
