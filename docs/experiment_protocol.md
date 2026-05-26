@@ -25,6 +25,15 @@ Out of scope:
 
 ## Standard Output Pipeline
 
+Run each experiment with the canonical mission launcher:
+
+```bash
+./scripts/run_demo_mission.sh <SCENARIO> <SEED>
+```
+
+The launcher freezes the validated inspect-all room mission profile. Use only
+the scenario and seed arguments for experiment variation.
+
 Each successful run should preserve the following generated files outside git:
 
 ```text

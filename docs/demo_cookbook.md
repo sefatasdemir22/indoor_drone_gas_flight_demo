@@ -45,52 +45,16 @@ Expected:
 
 ## 4. Current Inspect-All Mission
 
-Use this for the current multi-room validation checkpoint.
+Use the canonical launcher for the current multi-room validation checkpoint.
+Gazebo/PX4/MicroXRCEAgent must already be running.
 
 ```bash
-python3 src/opening_based_gas_survey_mission.py \
-  --position-room-inspection-check \
-  --inspect-all-openings \
-  --enable-no-backtrack-door-capture \
-  --enable-room-facing-yaw-entry \
-  --enable-room-facing-post-yaw-realign \
-  --enable-position-return-home \
-  --enable-position-landing-stabilization \
-  --position-step-count 35 \
-  --position-forward-step 0.4 \
-  --position-hold-seconds 2.5 \
-  --position-altitude 1.2 \
-  --position-yaw 90.0 \
-  --room-facing-step-distance 0.25 \
-  --room-facing-max-distance 8.0 \
-  --room-facing-front-stop-distance 1.5 \
-  --room-facing-exit-step-distance 0.5 \
-  --room-facing-step-hold-seconds 0.8 \
-  --room-facing-door-forward-offset 0.25 \
-  --room-facing-yaw-hold-before-seconds 0.5 \
-  --room-facing-yaw-hold-after-seconds 1.0 \
-  --room-facing-yaw-settle-repeat-count 5 \
-  --room-facing-yaw-settle-repeat-interval 0.2 \
-  --room-facing-yaw-interpolation-step-deg 15 \
-  --room-facing-yaw-interpolation-hold-seconds 0.2 \
-  --room-facing-post-yaw-min-front-clearance 2.0 \
-  --room-facing-post-yaw-forward-offset-step 0.10 \
-  --room-facing-post-yaw-max-forward-offset 0.30 \
-  --door-capture-confirm-frames 3 \
-  --door-capture-crawl-step 0.15 \
-  --door-capture-max-crawl-steps 2 \
-  --door-capture-hold-seconds 0.8 \
-  --position-return-step-distance 0.6 \
-  --position-return-hold-seconds 1.2 \
-  --position-return-arrival-tolerance 0.35 \
-  --position-return-max-distance 20.0 \
-  --position-landing-final-altitude 0.22 \
-  --position-landing-step-hold-seconds 2.0 \
-  --position-landing-final-hold-seconds 2.0 \
-  --max-inspections 5 \
-  --gas-scenario possible_gas_zone_4 \
-  --gas-seed 1
+./scripts/run_demo_mission.sh possible_gas_zone_4 1
 ```
+
+The validated mission parameters are frozen in `scripts/run_demo_mission.sh` to
+avoid command drift across experiments. Use script arguments only for scenario
+and seed changes, for example `./scripts/run_demo_mission.sh no_gas 1`.
 
 Expected high-level behavior:
 

@@ -64,21 +64,16 @@ Terminal 2:
 
 ```bash
 cd ~/Desktop/indoor_drone_gas_flight_demo
-python3 src/opening_based_gas_survey_mission.py \
-  --position-room-inspection-check \
-  --inspect-all-openings \
-  --enable-no-backtrack-door-capture \
-  --enable-room-facing-yaw-entry \
-  --enable-room-facing-post-yaw-realign \
-  --enable-position-return-home \
-  --enable-position-landing-stabilization \
-  --room-facing-front-stop-distance 1.5 \
-  --max-inspections 5 \
-  --gas-scenario possible_gas_zone_4 \
-  --gas-seed 1
+./scripts/run_demo_mission.sh possible_gas_zone_4 1
 ```
 
-Bu README komutu ana modlari gosterir. Tam validasyon parametreleri icin `docs/demo_cookbook.md` dosyasindaki "Current Inspect-All Mission" komutu kullanilmalidir.
+Bu script validated demo parametrelerini tek yerde dondurur. Senaryo ve seed
+degistirmek icin sadece script argumanlarini kullan:
+
+```bash
+./scripts/run_demo_mission.sh no_gas 1
+./scripts/run_demo_mission.sh multi_1_2 1
+```
 
 `--inspect-all-openings` aktifken `--max-inspections` hedef oda sayisi degil, safety cap olarak kullanilir. Mevcut demo dunyasinda birden fazla farkli opening inspection edilmesi, ayni opening devamlarinin suppression ile atlanmasi, return-home'un tamamlanmasi ve staged landing'in calismasi beklenir.
 
