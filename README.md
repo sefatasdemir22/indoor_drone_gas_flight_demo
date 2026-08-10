@@ -1,157 +1,109 @@
 # Indoor Drone Gas Flight Demo
 
-PX4/Gazebo tabanli bu demo, GPS olmayan kapali ortamda drone'un koridorda ilerlemesini, gordugu farkli oda/acikliklari inspection etmesini, gaz olcumu almasini, koridora geri donmesini ve gorev sonunda local home noktasina return-home yapip yumusak inmesini gosterir.
+A ROS 2 / PX4 simulation project for autonomous indoor gas-inspection missions in a GPS-denied corridor-and-room environment.
 
-Mevcut ana checkpoint:
+The system detects room openings from LaserScan data, inspects multiple rooms without relying on preconfigured room coordinates, samples simulated gas concentrations, returns to a local home reference, and performs a staged landing.
 
-- Git checkpoint: `ce86e82 Add inspect-all openings mission mode`
-- Tag: `milestone_inspect_all_v1`
-- Ana gorev scripti: `src/opening_based_gas_survey_mission.py`
-- Ana cikti: `results/opening_inspection_events.json`
+## Project Scope
 
-Bu proje tam SLAM, global planner veya bilinmeyen ortam topoloji haritasi iddiasi tasimaz. Mevcut hedef, sinirli corridor-room dunyasinda LaserScan tabanli aciklik algilama, coklu oda inspection, return-home ve stabil landing akisini dogrulamaktir.
+This repository represents the final flight-demo phase of my indoor autonomous drone graduation project. The focus is a reproducible mission pipeline in a constrained indoor environment rather than a claim of full unknown-environment autonomy.
 
-## Kullanilan Teknolojiler
+**Validated scope:**
 
-- ROS2 Humble
-- Gazebo Classic
-- PX4 SITL
-- MicroXRCEAgent
-- MAVSDK
-- Python
-
-## Guncel Calisan Akis
-
-Ana position-mode room-inspection akisi su davranislari icerir:
-
-- inspect-all openings modu
-- opening candidate detection
-- same-side suppression ile ayni odaya tekrar girmeme
-- no-backtrack door capture
-- door forward offset
-- room-facing yaw entry
-- yaw interpolation
-- post-yaw realignment
-- front-distance stop traversal
-- gas baseline ve inspection olcumu
-- incremental room exit
-- corridor continuation
-- return-home
+- corridor following in a GPS-denied simulation
+- LaserScan-based opening detection
+- multi-room inspection
+- duplicate-opening suppression
+- room-facing yaw alignment and controlled entry
+- simulated gas baseline and inspection measurements
+- corridor re-entry and mission continuation
+- return to a local home reference
 - staged landing stabilization
 
-Drone oda koordinatlarini onceden bilmez. Aciklik adaylari dar decision LaserScan verileriyle algilanir. Oda icine giriste drone yaw degistirerek odaya kendi front yonuyle girer; oda icinde durma karari `front_min` mesafesine dayanir.
+The project **does not** implement full SLAM, a global planner, or general-purpose unknown-environment topology mapping.
 
-## Baslatma
+## Tech Stack
 
-Terminal 1:
+- ROS 2 Humble
+- PX4 SITL
+- Gazebo Classic
+- MAVSDK
+- Micro XRCE-DDS Agent
+- Python
+
+## Mission Flow
+
+The main mission implementation is:
+
+```text
+src/opening_based_gas_survey_mission.py
+```
+
+A typical mission follows this sequence:
+
+```text
+Takeoff
+  -> Follow corridor
+  -> Detect opening
+  -> Align with room
+  -> Enter and inspect
+  -> Sample gas
+  -> Exit room
+  -> Continue corridor
+  -> Inspect additional openings
+  -> Return home
+  -> Stabilize and land
+```
+
+Opening candidates are inferred from directional LaserScan observations. During room entry, the vehicle rotates toward the room and uses forward-distance measurements to control traversal rather than navigating to a predefined room coordinate.
+
+## Run the Simulation
+
+Start the PX4/Gazebo environment:
 
 ```bash
 cd ~/Desktop/indoor_drone_gas_flight_demo
 ./baslat.sh
 ```
 
-Bu komut Gazebo GUI, `simple_corridor_room.world`, PX4 SITL ve iris spawn akisini baslatir.
-
-Topic kontrolu icin:
-
-```bash
-ros2 topic list | grep -Ei "front_scan|left_scan|right_scan|decision_scan|vehicle_local_position"
-```
-
-## Ana Inspect-All Mission Komutu
-
-Terminal 2:
+Run the validated inspect-all mission profile from a second terminal:
 
 ```bash
 cd ~/Desktop/indoor_drone_gas_flight_demo
 ./scripts/run_demo_mission.sh possible_gas_zone_4 1
 ```
 
-Bu script validated demo parametrelerini tek yerde dondurur. Senaryo ve seed
-degistirmek icin sadece script argumanlarini kullan:
+Other example scenarios:
 
 ```bash
 ./scripts/run_demo_mission.sh no_gas 1
 ./scripts/run_demo_mission.sh multi_1_2 1
 ```
 
-`--inspect-all-openings` aktifken `--max-inspections` hedef oda sayisi degil, safety cap olarak kullanilir. Mevcut demo dunyasinda birden fazla farkli opening inspection edilmesi, ayni opening devamlarinin suppression ile atlanmasi, return-home'un tamamlanmasi ve staged landing'in calismasi beklenir.
+## Experiment Output
 
-## Event JSON
-
-Mission sonucu su dosyaya yazilir:
+Mission events are written to:
 
 ```text
 results/opening_inspection_events.json
 ```
 
-Ust seviye alanlar:
+The output records information such as:
 
-- `events`
-- `return_home`
+- inspection index and detected side
+- opening identifier
+- room traversal distance and stop reason
+- final front-distance measurement
+- gas baseline and inspection averages
+- concentration delta
+- gas-candidate decision
+- return-home status and final home distance
 
-Her event icin onemli alanlar:
+A successful inspect-all run produces multiple valid inspection events and completes the return-home sequence.
 
-- `inspection_index`
-- `side`
-- `opening_id`
-- `entry_anchor_source`
-- `room_traversal_mode`
-- `room_traverse_stop_reason`
-- `room_traverse_actual_distance_m`
-- `room_facing_final_front_min_m`
-- `baseline_avg_ppm`
-- `inspection_avg_ppm`
-- `delta_ppm`
-- `gas_candidate`
-- `room_facing_yaw_interpolation_step_deg`
-- `room_facing_exit_steps`
+## Gas Mapping Utilities
 
-Return-home icin onemli alanlar:
-
-- `enabled`
-- `attempted`
-- `status`
-- `steps`
-- `actual_distance_m`
-- `final_distance_to_home_m`
-
-Basarili inspect-all checkpoint testinde birden fazla valid event uretilir ve `return_home.status="completed"` beklenir.
-
-## Tez ve Sunum Ciktilari
-
-Runtime ve post-process ciktilari `results/` altinda uretilir ve Git'e alinmaz.
-Tez/sunum icin secilen final gorsel, tablo ve teslim paketleri elle
-`thesis_assets/` altina kopyalanabilir:
-
-- `thesis_assets/figures/`: final heatmap, 3D visualization, screenshot ve sunum gorselleri
-- `thesis_assets/tables/`: final CSV/tablo ciktilari
-- `thesis_assets/package/`: teslim veya paylasim paketleri
-
-Bu klasorler secilmis tez artefactlari icindir; ham `results/` klasorunun
-tam kopyasi olarak kullanilmamalidir.
-
-## Dry-Run Kontrolleri
-
-PX4/Gazebo baslatmadan hizli kontrol:
-
-```bash
-python3 -m py_compile src/opening_based_gas_survey_mission.py
-python3 -m py_compile src/opening_event_builder.py
-python3 -m py_compile src/opening_mission_types.py
-python3 -m py_compile src/opening_scan_decision.py
-python3 src/opening_based_gas_survey_mission.py --dry-run --dry-run-scenario normal_corridor_side_distance
-python3 src/opening_based_gas_survey_mission.py --dry-run --dry-run-scenario front_blocked_left_open
-```
-
-Beklenen:
-
-- `normal_corridor_side_distance` -> `FOLLOW_FORWARD`
-- `front_blocked_left_open` -> `BYPASS_LEFT`
-
-## Yardimci Gaz Gorsellestirme
-
-Gaz heatmap araclari ayri kullanilabilir. Bunlar drone'u kontrol etmez; CSV/JSON/PNG uretir.
+The repository also contains utilities for simulated gas-field visualization and post-processing:
 
 ```bash
 ./scripts/run_mapper.sh random
@@ -160,41 +112,45 @@ Gaz heatmap araclari ayri kullanilabilir. Bunlar drone'u kontrol etmez; CSV/JSON
 ./scripts/run_mapper.sh multi_all
 ```
 
-Live ROS2 gas mapping de ayri bir yardimci akistir:
+Selected figures, tables, and presentation artifacts can be stored under `thesis_assets/`, while raw runtime outputs remain under `results/`.
+
+## Dry-Run Checks
+
+Core mission logic can be checked without launching PX4 or Gazebo:
 
 ```bash
-python3 src/live_gas_mapping_ros2.py \
-  --scenario possible_gas_zone_4 \
-  --duration-seconds 30 \
-  --sample-rate-hz 5 \
-  --seed 1 \
-  --hide-source-marker \
-  --route-min-altitude 0.5
+python3 -m py_compile src/opening_based_gas_survey_mission.py
+python3 -m py_compile src/opening_event_builder.py
+python3 -m py_compile src/opening_mission_types.py
+python3 -m py_compile src/opening_scan_decision.py
+
+python3 src/opening_based_gas_survey_mission.py \
+  --dry-run \
+  --dry-run-scenario normal_corridor_side_distance
+
+python3 src/opening_based_gas_survey_mission.py \
+  --dry-run \
+  --dry-run-scenario front_blocked_left_open
 ```
 
-## Legacy / Diagnostic Akislar
+## Current Checkpoint
 
-Repo icinde onceki fazlardan kalan diagnostic scriptler korunur:
+- Tag: `milestone_inspect_all_v1`
+- Main mission: `src/opening_based_gas_survey_mission.py`
+- Main event output: `results/opening_inspection_events.json`
 
-- `src/mission_manager.py`
-- `src/safe_corridor_mission.py`
-- velocity/crab-mode inspection secenekleri
-- `--position-side-sign-check`
+Legacy and diagnostic scripts from earlier development phases are intentionally preserved in the repository, but they are not the primary demo path.
 
-Bunlar ana demo akisi degildir. Ana guncel demo `src/opening_based_gas_survey_mission.py --position-room-inspection-check --inspect-all-openings` ve room-facing yaw modudur.
+## Documentation
 
-## Bilinen Sinirlar
+- [`docs/phase_checkpoint.md`](docs/phase_checkpoint.md) — validated checkpoint summary
+- [`docs/demo_cookbook.md`](docs/demo_cookbook.md) — demo and test commands
+- [`docs/flight_demo_notes.md`](docs/flight_demo_notes.md) — earlier implementation notes
 
-- Full SLAM yok.
-- Global planner yok.
-- `position_step_count` halen corridor mission siniridir.
-- `max_inspections`, inspect-all modunda safety cap olarak kalir.
-- Gas candidate boolean threshold konservatiftir; delta degerleri event JSON'da gorunse de `gas_candidate=false` kalabilir.
-- Red/low obstacle ve lidar geometri sinirlari simulasyon dunyasina baglidir.
-- Yuksek gaz bulununca gorevi erken bitirme henuz eklenmedi.
+## Limitations
 
-## Ek Dokumantasyon
-
-- `docs/phase_checkpoint.md`: guncel checkpoint ozeti
-- `docs/demo_cookbook.md`: test ve demo komutlari
-- `docs/flight_demo_notes.md`: eski altyapi notlari
+- No full SLAM pipeline
+- No global planner
+- Mission behavior is tuned for the provided corridor-room simulation
+- Gas detection uses a conservative threshold and may preserve measured deltas even when a candidate is not flagged
+- Early mission termination after detecting high gas concentration is not implemented
